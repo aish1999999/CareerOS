@@ -1,0 +1,1655 @@
+import type { CascadeCategory, MatchResult, OptionSet, PageContext, SignalBundle } from '@/types'
+import { MULTISELECT_CONTAINER_SELECTOR, resolveOptionText, type DateSegmentEls, type DetectedField } from '@/content/detector'
+import { brandTokens, brandedOptionIndex } from '@/content/capture'
+import { parseDateParts } from '@/lib/dates'
+
+export { parseDateParts, type DateParts } from '@/lib/dates'
+import { answerVariants, chooseOption, chooseOptions, realOptionCount, semanticAnswerOption, semanticCascadeAvailable, semanticCascadePath, semanticChooseOption } from '@/content/matcher'
+import { lexicalAnswerScore } from '@/lib/scorers/lexical'
+import { getAdapter } from '@/content/adapters/index'
+
+// ---------------------------------------------------------------------------
+// Autofill engine (Section 8) — the ONLY module that writes to the DOM.
+// Values are always set via native value setters / clicks and real events so
+// React/Vue/Angular register them; never innerHTML, never auto-submit.
+// ---------------------------------------------------------------------------
+
+export type FillOutcome = 'filled' | 'failed' | 'refused'
+
+/** What actually landed: for deferred-inference dropdowns the caller only
+ *  learns the answer here (the judge picked it after the popup opened). */
+export interface FillResult {
+  outcome: FillOutcome
+  filledText: string | null
+}
+
+export interface FillFieldOptions {
+  /** User clicked Accept on a chip — consent boxes may be ticked on this
+   *  path (their match is chip-only, so this is the only way they fill). */
+  userInitiated?: boolean
+  /** Applicant fact sheet for fill-time inference (match.inferAtFill). */
+  factSheet?: string | null
+  /** For file fields: the stored document's bytes, fetched by the caller
+   *  from match.source ("document:<id>") — bytes never ride in MatchResult. */
+  document?: DocumentPayload | null
+}
+
+export interface DocumentPayload {
+  name: string
+  mime: string
+  bytes: Uint8Array
+}
+
+/** React-safe value assignment: use the native prototype setter so the
+ *  framework's value tracker sees the change, then fire real events. */
+export function setNativeValue(el: HTMLInputElement | HTMLTextAreaElement, value: string): void {
+  const proto =
+    el instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype
+  const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set
+  if (setter) setter.call(el, value)
+  else el.value = value
+  el.dispatchEvent(new Event('input', { bubbles: true }))
+  el.dispatchEvent(new Event('change', { bubbles: true }))
+}
+
+function formatDateForInput(value: string, targetType: string, placeholder: string = ''): string {
+  const parts = parseDateParts(value)
+  if (!parts) return value
+  const { year, month, day } = parts
+
+  if (targetType === 'month') return `${year}-${month}`
+  if (targetType === 'date') return `${year}-${month}-${day}`
+
+  if (targetType === 'text') {
+    const p = placeholder.toUpperCase()
+    if (p.includes('MM/YYYY') || p.includes('MM / YYYY')) return `${month}/${year}`
+    if (p.includes('YYYY-MM-DD') || p.includes('YYYY/MM/DD')) return `${year}-${month}-${day}`
+    if (p.includes('MM/DD/YYYY') || p.includes('MM / DD / YYYY')) return `${month}/${day}/${year}`
+    if (p.includes('DD/MM/YYYY') || p.includes('DD / MM / YYYY')) return `${day}/${month}/${year}`
+  }
+
+  return value
+}
+
+/** Digit keyCodes equal their charCodes (48–57); widgets still reading the
+ *  legacy e.keyCode/e.which get the right number. */
+function syntheticKeyEvent(type: string, ch: string): KeyboardEvent {
+  const event = new KeyboardEvent(type, {
+    key: ch,
+    code: /^\d$/.test(ch) ? `Digit${ch}` : `Key${ch.toUpperCase()}`,
+    bubbles: true,
+    cancelable: true,
+  })
+  const legacy = ch.charCodeAt(0)
+  Object.defineProperty(event, 'keyCode', { get: () => legacy })
+  Object.defineProperty(event, 'which', { get: () => legacy })
+  return event
+}
+
+/** One simulated keystroke: keydown/keypress/keyup around the browser's
+ *  editing pipeline (execCommand insertText → trusted input events in
+ *  Chrome), with a manual beforeinput/setter/input fallback. A widget that
+ *  preventDefault()s the keydown inserts the character itself. */
+function typeChar(target: HTMLInputElement, ch: string, replace: boolean): void {
+  const browserInserts = target.dispatchEvent(syntheticKeyEvent('keydown', ch))
+  if (browserInserts) {
+    target.dispatchEvent(syntheticKeyEvent('keypress', ch))
+    let inserted = false
+    try {
+      inserted =
+        typeof document.execCommand === 'function' &&
+        document.execCommand('insertText', false, ch)
+    } catch {
+      inserted = false // jsdom and friends
+    }
+    if (!inserted) {
+      target.dispatchEvent(
+        new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: ch }),
+      )
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+      const next = replace ? ch : target.value + ch // replace the selected residue
+      if (setter) setter.call(target, next)
+      else target.value = next
+      target.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: ch }))
+    }
+  }
+  target.dispatchEvent(syntheticKeyEvent('keyup', ch))
+}
+
+const numericEqual = (a: string, b: string) => parseInt(a, 10) === parseInt(b, 10)
+
+/** Workday-style segmented dates: Month/Day/Year are separate React-controlled
+ *  spinbutton inputs behind ONE composite widget that manages focus itself —
+ *  a complete month auto-advances to the year, and programmatically focusing
+ *  a later segment can bounce focus back to the first one (which is how the
+ *  year's leading "2" was overwriting every month with "02"). So type the
+ *  padded date as one keystroke stream, exactly like a user: focus a segment
+ *  only if the widget didn't already move there, and land every character on
+ *  whichever segment actually holds focus. */
+export function fillDateSegments(segments: DateSegmentEls, value: string): FillOutcome {
+  const parts = parseDateParts(value)
+  if (!parts) return 'failed'
+  const writes: [HTMLInputElement, string][] = []
+  if (segments.month) writes.push([segments.month, parts.month]) // padded "01" — completes
+  if (segments.day) writes.push([segments.day, parts.day]) //          the segment, so the
+  if (segments.year) writes.push([segments.year, parts.year]) //       widget auto-advances
+  if (writes.length === 0) return 'failed'
+  const doc = writes[0][0].ownerDocument
+  const isSegment = (node: Element | null): node is HTMLInputElement =>
+    node === segments.month || node === segments.day || node === segments.year
+
+  for (const [el, segment] of writes) {
+    if (doc.activeElement !== el) {
+      el.focus()
+      if (el.value) el.select() // replace residue, never append to it
+    }
+    let first = true
+    for (const ch of segment) {
+      // Follow the widget's focus, wherever it moved it
+      const active = doc.activeElement
+      const target = isSegment(active) ? active : el
+      typeChar(target, ch, first && target === el)
+      first = false
+    }
+    if (numericEqual(el.value, segment)) {
+      el.dispatchEvent(new Event('change', { bubbles: true }))
+    } else {
+      setNativeValue(el, segment) // keys swallowed or misrouted — hard reset
+    }
+  }
+  // Single group exit → Workday validates once, against the complete date
+  const active = doc.activeElement
+    ; (isSegment(active) ? active : writes[writes.length - 1][0]).blur()
+  // Workday may re-render "01" as "1"; compare numerically, not textually
+  return writes.every(([el, segment]) => numericEqual(el.value, segment)) ? 'filled' : 'failed'
+}
+
+export function fillTextInput(el: HTMLInputElement | HTMLTextAreaElement, value: string, signal?: SignalBundle): FillOutcome {
+  el.focus()
+  let finalValue = value
+  if (el instanceof HTMLInputElement && (el.type === 'date' || el.type === 'month' || signal?.kind === 'date')) {
+    finalValue = formatDateForInput(value, el.type, signal?.placeholder || '')
+  }
+  setNativeValue(el, finalValue)
+  el.blur() // satisfy blur-based validation
+  return el.value === finalValue ? 'filled' : 'failed'
+}
+
+/** Dependent selects (Country → State) populate over XHR after their parent
+ *  commits — give the list a moment to arrive before judging. */
+const SELECT_OPTIONS_TIMEOUT_MS = 3000
+
+export async function fillSelect(
+  el: HTMLSelectElement,
+  optionValue: string | undefined,
+  answerText: string,
+  optionSets: OptionSet[] = [],
+  answerFallbacks: string[] = [],
+  judgeOnly = false,
+): Promise<FillOutcome> {
+  const liveOptions = () =>
+    [...el.options].map((o) => ({ value: o.value, text: o.text.trim() }))
+  if (realOptionCount(liveOptions()) === 0) {
+    const deadline = Date.now() + SELECT_OPTIONS_TIMEOUT_MS
+    while (realOptionCount(liveOptions()) === 0 && Date.now() < deadline) {
+      await wait(DROPDOWN_POLL_MS)
+    }
+  }
+  const domOptions = [...el.options]
+  let target = optionValue !== undefined && domOptions.some((o) => o.value === optionValue)
+    ? domOptions.find((o) => o.value === optionValue)
+    : undefined
+  const candidates = domOptions.filter((o) => o.value !== '' || o.text.trim() !== '')
+  const asOptions = candidates.map((o) => ({ value: o.value, text: o.text.trim() }))
+  if (!target && !judgeOnly) {
+    // same matching brain as match time (Section 8) — skip placeholder
+    // options; alternates tried in order ("Industrial Engineering" →
+    // "Engineering") when the primary answer isn't offered
+    for (const answer of [answerText, ...answerFallbacks]) {
+      const choice = chooseOption(asOptions, answer, optionSets)
+      if (choice) {
+        target = candidates[choice.index]
+        break
+      }
+    }
+  }
+  if (!target) {
+    // meaning-level fallback (semantic judge) when wording differs entirely
+    const semantic = await semanticChooseOption(asOptions, answerText)
+    if (semantic) target = candidates[semantic.index]
+  }
+  if (!target) return 'failed'
+  const targetIndex = domOptions.indexOf(target)
+  el.focus()
+  el.selectedIndex = targetIndex // by index — option values may be empty/duplicated
+  el.dispatchEvent(new Event('input', { bubbles: true }))
+  el.dispatchEvent(new Event('change', { bubbles: true }))
+  if (el.selectedIndex === targetIndex) return 'filled'
+  // React-controlled selects re-render from state a beat later — a sync
+  // check races the re-render and reports false failure. Re-verify.
+  await wait(300)
+  return el.selectedIndex === targetIndex ? 'filled' : 'failed'
+}
+
+export async function fillRadioGroup(
+  radios: HTMLInputElement[],
+  chosenValue: string | undefined,
+  answerText: string,
+  optionSets: OptionSet[] = [],
+  answerFallbacks: string[] = [],
+  judgeOnly = false,
+): Promise<FillOutcome> {
+  let target = chosenValue !== undefined ? radios.find((r) => r.value === chosenValue) : undefined
+  // Same option-text mini-cascade the detector used at match time — fill and
+  // match must score identical strings (label sources → following text node
+  // → coded value last).
+  const asOptions = radios.map((r) => ({
+    value: r.value,
+    text: (resolveOptionText(r, r.ownerDocument ?? document) || r.value).trim(),
+  }))
+  if (!target && !judgeOnly) {
+    // same matching brain as match time; unfiltered parallel array so the
+    // returned index maps straight back to the radio (values are often
+    // empty or duplicated — never select by value here)
+    for (const answer of [answerText, ...answerFallbacks]) {
+      const choice = chooseOption(asOptions, answer, optionSets)
+      if (choice) {
+        target = radios[choice.index]
+        break
+      }
+    }
+  }
+  if (!target) {
+    const semantic = await semanticChooseOption(asOptions, answerText)
+    if (semantic) target = radios[semantic.index]
+  }
+  if (!target) return 'failed'
+  target.click() // real click so frameworks register (Section 8)
+  return target.checked ? 'filled' : 'failed'
+}
+
+/** Pill groups (Oracle CX questionnaire): toggle BUTTONS — no value
+ *  anywhere, selection is a click, state is aria-pressed. Never clicks an
+ *  already-pressed pill (in the widget's single-select mode that DESELECTS
+ *  the answer to empty — verified in the cx-select-pills source), and never
+ *  reports filled without seeing aria-pressed flip — the framework commits
+ *  only through its own click handler. `multi` (checkbox semantics): every
+ *  pill the compound answer places gets pressed, none get UNpressed. */
+export interface PillFillResult {
+  outcome: FillOutcome
+  /** The option text(s) that actually landed — validation must compare the
+   *  page against THIS, not against the stored answer wording (a semantic
+   *  bridge placing "Occasionally" on "Sometimes" is a correct fill). */
+  pickedText: string | null
+}
+
+export async function fillPillGroup(
+  pills: HTMLElement[],
+  chosenValue: string | undefined,
+  answerText: string,
+  optionSets: OptionSet[] = [],
+  answerFallbacks: string[] = [],
+  judgeOnly = false,
+  multi = false,
+): Promise<PillFillResult> {
+  const isPressed = (p: HTMLElement) => p.getAttribute('aria-pressed') === 'true'
+  // Index-parallel option list, same texts the detector scored at match time
+  const asOptions = pills.map((p) => {
+    const text = (p.textContent ?? '').trim()
+    return { value: text, text }
+  })
+
+  /** Press one pill: click → poll aria-pressed → trusted-click escalation.
+   *  The poll is generous (slow widgets commit after a server round-trip)
+   *  and every escalation step re-verifies state AND node identity first: a
+   *  second click on a pill that committed meanwhile would TOGGLE it OFF,
+   *  and a recycled node may render a different option than the one chosen
+   *  (both review catches 2026-07-17). */
+  const press = async (target: HTMLElement, wantText: string): Promise<boolean> => {
+    if (isPressed(target)) return true // already committed — never re-click
+    userClick(target)
+    let deadline = Date.now() + 1500 // async commits — poll generously
+    while (Date.now() < deadline) {
+      if (isPressed(target)) return true
+      await wait(DROPDOWN_POLL_MS)
+    }
+    // Re-verify RIGHT before the trusted tier: the synthetic click's commit
+    // may have landed after the poll, and a real second click would undo it.
+    if (isPressed(target)) return true
+    if (!target.isConnected || (target.textContent ?? '').trim() !== wantText) {
+      dropdownDebug('pill', `target node recycled before escalation ("${wantText}") — honest fail`)
+      return false
+    }
+    dropdownDebug('pill', `aria-pressed unchanged after click on "${wantText}" — escalating`)
+    if (await trustedClick(target)) {
+      deadline = Date.now() + 800
+      while (Date.now() < deadline) {
+        if (isPressed(target)) return true
+        await wait(DROPDOWN_POLL_MS)
+      }
+    }
+    return false
+  }
+
+  if (multi) {
+    // "Select all that apply" pills: press every option the answer places
+    // (compound answers split), never unpress the rest — same contract as
+    // fillCheckboxGroup (wrong uncheck destroys a user's explicit choice).
+    let indexes = judgeOnly ? [] : chooseOptions(asOptions, answerText, optionSets).map((c) => c.index)
+    if (indexes.length === 0) {
+      const semantic = await semanticChooseOption(asOptions, answerText)
+      if (semantic) indexes = [semantic.index]
+    }
+    if (indexes.length === 0) return { outcome: 'failed', pickedText: null }
+    let allPressed = true
+    const pressed: string[] = []
+    for (const index of new Set(indexes)) {
+      if (await press(pills[index], asOptions[index].text)) pressed.push(asOptions[index].text)
+      else allPressed = false
+    }
+    return allPressed
+      ? { outcome: 'filled', pickedText: pressed.join('; ') }
+      : { outcome: 'failed', pickedText: null }
+  }
+
+  let targetIndex = -1
+  if (chosenValue !== undefined) {
+    targetIndex = asOptions.findIndex((o) => o.text === chosenValue)
+  }
+  if (targetIndex < 0 && !judgeOnly) {
+    for (const answer of [answerText, ...answerFallbacks]) {
+      const choice = chooseOption(asOptions, answer, optionSets)
+      if (choice) {
+        targetIndex = choice.index
+        break
+      }
+    }
+  }
+  if (targetIndex < 0) {
+    const semantic = await semanticChooseOption(asOptions, answerText)
+    if (semantic) targetIndex = semantic.index
+  }
+  if (targetIndex < 0) return { outcome: 'failed', pickedText: null }
+  const ok = await press(pills[targetIndex], asOptions[targetIndex].text)
+  return ok
+    ? { outcome: 'filled', pickedText: asOptions[targetIndex].text }
+    : { outcome: 'failed', pickedText: null }
+}
+
+/** blockConsent = consent box on the AUTOMATIC path (certification/at-will
+ *  boxes and user-accepted chips pass false — the two ways consent may tick). */
+export function fillCheckbox(el: HTMLInputElement, shouldCheck: boolean, blockConsent: boolean): FillOutcome {
+  if (blockConsent) return 'refused' // never SILENTLY check consent (Section 8/13)
+  if (el.checked !== shouldCheck) el.click()
+  return el.checked === shouldCheck ? 'filled' : 'failed'
+}
+
+/** Multi-select checkbox group ("check all that apply"): check every box the
+ *  answer places, and NEVER uncheck the rest — a wrong uncheck destroys a
+ *  user's explicit choice, a stray leftover is visible and reviewable. */
+export function fillCheckboxGroup(
+  boxes: HTMLInputElement[],
+  answerText: string,
+  optionSets: OptionSet[] = [],
+  consentLike = false,
+): FillOutcome {
+  if (consentLike) return 'refused'
+  // Live labels, index-parallel to boxes (like radio groups — values are
+  // often empty or duplicated, so selection is by index, never by value)
+  const options = boxes.map((box) => ({
+    value: box.value,
+    text: (box.labels?.[0]?.textContent ?? box.value).trim(),
+  }))
+  const choices = chooseOptions(options, answerText, optionSets)
+  if (choices.length === 0) return 'failed'
+  const want = new Set(choices.map((c) => c.index))
+  for (const index of want) {
+    if (!boxes[index].checked) boxes[index].click() // real click (Section 8)
+  }
+  return choices.every((c) => boxes[c.index].checked) ? 'filled' : 'failed'
+}
+
+export function fillContentEditable(el: HTMLElement, value: string): FillOutcome {
+  el.focus()
+  // Signal intent to rich-text editors, then set plain text — never HTML
+  el.dispatchEvent(
+    new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: value }),
+  )
+  el.textContent = value
+  el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }))
+  el.blur()
+  return (el.textContent ?? '') === value ? 'filled' : 'failed'
+}
+
+// ---- Custom (div-based) dropdowns --------------------------------------------
+
+const DROPDOWN_POLL_MS = 100
+/** Workday fetches many option lists over the network after the popup opens
+ *  (country, source, device type) — a short wait only ever sees the static
+ *  Yes/No lists. Polling exits early, so fast lists pay no extra cost. */
+const DROPDOWN_TIMEOUT_MS = 5000
+/** How long to watch for a sub-level after clicking a LEAF (no expandable
+ *  hint): the list closing quickly is the normal committed-selection signal. */
+const SUBLEVEL_TIMEOUT_MS = 600
+/** Sub-levels Workday fetches over the NETWORK ("Company Website" → the
+ *  company-domain list): the panel empties the instant the category is
+ *  clicked and repopulates only when the fetch lands — seconds later. When
+ *  the clicked row advertised a sub-level, wait like a dropdown open, not
+ *  like a commit, or the fill stops at the primary option. */
+const SUBLEVEL_FETCH_TIMEOUT_MS = 4000
+/** Hierarchical prompts: at most this many category branches are explored.
+ *  Workday "How did you hear about us?" trees run 6–8 categories, and the
+ *  cascade judge needs the whole tree to weigh the combination. */
+const EXPLORE_CAP = 8
+const MAX_PROMPT_DEPTH = 3
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+// Covers listboxes built from ordered/unordered lists, menus, and trees —
+// not just literal role=option rows.
+const DEFAULT_OPTION_SELECTOR =
+  '[role="option"], [role="listbox"] li, [role="menu"] [role="menuitem"], ' +
+  '[role="menu"] [role="menuitemradio"], [role="tree"] [role="treeitem"]'
+
+/** Style-based visibility (jsdom-safe): a hidden templated option elsewhere
+ *  in the DOM must never be matched — clicking it does nothing. */
+function isVisibleOption(el: HTMLElement): boolean {
+  if (el.closest('[hidden], [aria-hidden="true"]')) return false
+  let node: HTMLElement | null = el
+  for (let depth = 0; node && depth < 4; depth++) {
+    if (node.style.display === 'none' || node.style.visibility === 'hidden') return false
+    if (typeof getComputedStyle === 'function') {
+      const computed = getComputedStyle(node)
+      if (computed.display === 'none' || computed.visibility === 'hidden') return false
+    }
+    node = node.parentElement
+  }
+  return true
+}
+
+function findDropdownOptions(doc: Document, hostname: string): HTMLElement[] {
+  // doc-aware lookup: vanity-domain deployments (careers.honeywell.com =
+  // Oracle CX) resolve their adapter by page fingerprint, not hostname.
+  const adapterSelector = getAdapter(hostname, doc)?.dropdownOptionSelector
+  const selector = adapterSelector ?? DEFAULT_OPTION_SELECTOR
+  return [...doc.querySelectorAll<HTMLElement>(selector)].filter(
+    (o) => o.textContent && o.textContent.trim() !== '' && isVisibleOption(o),
+  )
+}
+
+const optionSignature = (options: HTMLElement[]): string =>
+  options.map((o) => o.textContent?.trim() ?? '').join('\u0000')
+
+const asFieldOptions = (options: HTMLElement[]) =>
+  options.map((o) => {
+    const text = o.textContent?.trim() ?? ''
+    return { value: text, text }
+  })
+
+/** Workday backs dropdowns with hidden inputs holding the internal WID — a
+ *  32-hex GUID that is never what the user sees. Reading it as display text
+ *  made the validator flag a correct "Mr." fill as WRONG (actual:
+ *  "cf171b11…", live Novonesis catch 2026-07-16). */
+const OPAQUE_VALUE_RE = /^[0-9a-f]{24,40}$/i
+
+/** What the closed dropdown trigger currently shows ("Select One" / "Yes").
+ *  Exported for the validation layer (validate.ts reads, never writes). */
+export function displayTextOf(el: HTMLElement): string {
+  const value = (el as HTMLInputElement).value
+  if (typeof value === 'string' && value.trim() && !OPAQUE_VALUE_RE.test(value.trim()))
+    return value.trim()
+  const aria = el.getAttribute('aria-valuetext')
+  if (aria?.trim()) return aria.trim()
+  const text = el.textContent?.trim() ?? ''
+  return OPAQUE_VALUE_RE.test(text) ? '' : text
+}
+
+/** Full user-gesture click: modern widgets often act on the pointer/mouse
+ *  phases rather than the bare click() MouseEvent. */
+function userClick(target: HTMLElement): void {
+  const init = { bubbles: true, cancelable: true, composed: true }
+  if (typeof PointerEvent === 'function') {
+    target.dispatchEvent(new PointerEvent('pointerover', init))
+    target.dispatchEvent(new PointerEvent('pointerdown', init))
+  }
+  target.dispatchEvent(new MouseEvent('mouseover', init))
+  target.dispatchEvent(new MouseEvent('mousedown', init))
+  if (typeof PointerEvent === 'function') target.dispatchEvent(new PointerEvent('pointerup', init))
+  target.dispatchEvent(new MouseEvent('mouseup', init))
+  target.click()
+}
+
+/** Click an option the way a user does — on its innermost content element
+ *  (Workday renders <li role="option"><div>Alabama</div></li> and its
+ *  delegated handlers see the DIV as the event target). Bubbling still
+ *  reaches the li. */
+function clickOptionElement(option: HTMLElement): void {
+  let target: HTMLElement = option
+  while (target.firstElementChild instanceof HTMLElement && target.children.length === 1) {
+    target = target.firstElementChild
+  }
+  userClick(target)
+}
+
+/** Plain-string breadcrumb (objects render as "Object Object" in some
+ *  console readers — keep these greppable text). */
+function dropdownDebug(step: string, detail: string): void {
+  console.debug(`[FlashFiller] dropdown ${step}: ${detail}`)
+}
+
+function pressKey(target: HTMLElement, key: string): void {
+  const code = /^[a-z0-9]$/i.test(key)
+    ? /\d/.test(key)
+      ? `Digit${key}`
+      : `Key${key.toUpperCase()}`
+    : key
+  target.dispatchEvent(new KeyboardEvent('keydown', { key, code, bubbles: true, cancelable: true }))
+  target.dispatchEvent(new KeyboardEvent('keyup', { key, code, bubbles: true }))
+}
+
+async function pollForOptions(doc: Document, timeoutMs: number): Promise<HTMLElement[]> {
+  const deadline = Date.now() + timeoutMs
+  let options: HTMLElement[] = []
+  while (Date.now() < deadline) {
+    options = findDropdownOptions(doc, doc.location.hostname)
+    if (options.length > 0) break
+    await wait(DROPDOWN_POLL_MS)
+  }
+  return options
+}
+
+// ---- Per-widget option scoping ----------------------------------------------------
+// Some ATSes keep EVERY dropdown's listbox permanently in the DOM (search-
+// comboboxes especially), so a document-wide option query can return another
+// widget's options — answers then fail to place, or worse, place on the wrong
+// list. Scope discovery to THIS widget: options that appeared after our
+// open-click (node-identity diff), else options aria-linked to or contained
+// by the trigger. Document-wide only when nothing pre-existed (legacy pages).
+
+type OptionScope = (all: HTMLElement[]) => HTMLElement[]
+
+function makeOptionScope(doc: Document, el: HTMLElement): OptionScope {
+  const pre = new Set(findDropdownOptions(doc, doc.location.hostname))
+  return (all) => {
+    const fresh = all.filter((o) => !pre.has(o))
+    if (fresh.length > 0) return fresh
+    const ids = `${el.getAttribute('aria-controls') ?? ''} ${el.getAttribute('aria-owns') ?? ''}`
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+    for (const id of ids) {
+      const owned = doc.getElementById(id)
+      if (owned) {
+        const within = all.filter((o) => owned.contains(o))
+        if (within.length > 0) return within
+      }
+    }
+    const inside = all.filter((o) => el.contains(o))
+    if (inside.length > 0) return inside
+    // Nothing attributable to this widget: with pre-existing foreign lists
+    // on the page, "all" would be contamination — return nothing instead.
+    return pre.size === 0 ? all : []
+  }
+}
+
+async function pollForScopedOptions(
+  doc: Document,
+  timeoutMs: number,
+  scope: OptionScope,
+): Promise<HTMLElement[]> {
+  const deadline = Date.now() + timeoutMs
+  for (; ;) {
+    const scoped = scope(findDropdownOptions(doc, doc.location.hostname))
+    if (scoped.length > 0 || Date.now() >= deadline) return scoped
+    await wait(DROPDOWN_POLL_MS)
+  }
+}
+
+/** pollForScopedOptions, but the poll only succeeds once the list DIFFERS
+ *  from `staleSignature` — after typing a filter term into a searchable
+ *  dropdown, re-picking from the same options that already failed to place
+ *  would just repeat the miss (virtualized catalogs re-render in place). */
+async function pollForFilteredOptions(
+  doc: Document,
+  timeoutMs: number,
+  scope: OptionScope,
+  staleSignature: string,
+): Promise<HTMLElement[]> {
+  const deadline = Date.now() + timeoutMs
+  for (; ;) {
+    const scoped = scope(findDropdownOptions(doc, doc.location.hostname))
+    if (scoped.length > 0 && optionSignature(scoped) !== staleSignature) return scoped
+    if (Date.now() >= deadline) return []
+    await wait(DROPDOWN_POLL_MS)
+  }
+}
+
+// ---- Trusted-input escalation (chrome.debugger via the service worker) ---------
+
+export type TrustedClick = (el: HTMLElement) => Promise<boolean>
+
+/** Ask the service worker for a REAL (isTrusted) click at the element's
+ *  viewport center via CDP — the same machinery Playwright uses, without
+ *  Node. No-ops outside an extension context (unit tests) and in subframes
+ *  (CDP input coordinates are main-frame viewport). */
+const defaultTrustedClick: TrustedClick = async (el) => {
+  try {
+    const runtime = (globalThis as { chrome?: typeof chrome }).chrome?.runtime
+    if (!runtime?.sendMessage || window !== window.top) return false
+    el.scrollIntoView({ block: 'center', inline: 'nearest' })
+    await wait(80) // let scroll/layout settle before measuring
+    const rect = el.getBoundingClientRect()
+    if (rect.width === 0 || rect.height === 0) return false
+    const response = (await runtime.sendMessage({
+      type: 'TRUSTED_CLICK',
+      x: Math.round(rect.left + rect.width / 2),
+      y: Math.round(rect.top + rect.height / 2),
+    })) as { ok?: boolean } | undefined
+    return !!response?.ok
+  } catch {
+    return false
+  }
+}
+
+let trustedClick: TrustedClick = defaultTrustedClick
+
+/** Test seam — pass null to restore the real provider. */
+export function setTrustedClick(fn: TrustedClick | null): void {
+  trustedClick = fn ?? defaultTrustedClick
+}
+
+export type TrustedType = (el: HTMLElement, text: string) => Promise<boolean>
+
+/** Trusted typing: real click to focus, then CDP Input.insertText — arrives
+ *  as a genuine user edit, which controlled inputs accept. */
+const defaultTrustedType: TrustedType = async (el, text) => {
+  try {
+    if (!(await trustedClick(el))) return false
+    const runtime = (globalThis as { chrome?: typeof chrome }).chrome?.runtime
+    if (!runtime?.sendMessage) return false
+    const response = (await runtime.sendMessage({ type: 'TRUSTED_TYPE', text })) as
+      | { ok?: boolean }
+      | undefined
+    return !!response?.ok
+  } catch {
+    return false
+  }
+}
+
+let trustedType: TrustedType = defaultTrustedType
+
+/** Test seam — pass null to restore the real provider. */
+export function setTrustedType(fn: TrustedType | null): void {
+  trustedType = fn ?? defaultTrustedType
+}
+
+/** Last-resort tier: rerun open → match → pick entirely with trusted clicks.
+ *  The page cannot tell these from a human hand. */
+async function trustedSelect(
+  el: HTMLElement,
+  answerText: string,
+  optionSets: OptionSet[],
+  initialDisplay: string,
+): Promise<FillOutcome> {
+  const doc = el.ownerDocument
+  if (!(await trustedClick(el))) return 'failed'
+  const options = await pollForOptions(doc, 3000)
+  if (options.length === 0) return 'failed'
+  const choice = chooseOption(asFieldOptions(options), answerText, optionSets)
+  if (!choice) {
+    el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    return 'failed'
+  }
+  if (!(await trustedClick(options[choice.index]))) return 'failed'
+  if (!initialDisplay) return 'filled'
+  const deadline = Date.now() + 1200
+  while (Date.now() < deadline) {
+    if (displayTextOf(el) !== initialDisplay) return 'filled'
+    await wait(DROPDOWN_POLL_MS)
+  }
+  return 'failed'
+}
+
+// ---- react-datepicker ------------------------------------------------------------
+// The input is a puppet: the library re-renders it from internal state, so
+// value writes (even per-keystroke synthetic ones) revert within ~100ms. The
+// popup IS the official pipeline — its cells run the library's own onChange.
+
+const MONTH_STEMS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+
+async function pollFor<T>(get: () => T | null, timeoutMs: number): Promise<T | null> {
+  const deadline = Date.now() + timeoutMs
+  let result = get()
+  while (!result && Date.now() < deadline) {
+    await wait(DROPDOWN_POLL_MS)
+    result = get()
+  }
+  return result
+}
+
+/** "Choose July 2026" / "Choose Monday, July 14th, 2026" → does it name the
+ *  target? Month cells need month+year; day cells additionally the day. */
+function cellMatches(label: string, year: number, month: number, day?: number): boolean {
+  if (!label.includes(String(year))) return false
+  const monthName = new RegExp(`\\b${MONTH_STEMS[month - 1]}`, 'i')
+  if (!monthName.test(label)) return false
+  if (day !== undefined && !new RegExp(`\\b${day}(st|nd|rd|th)?\\b`).test(label)) return false
+  return true
+}
+
+function isDisabledCell(cell: HTMLElement): boolean {
+  return cell.className.includes('--disabled') || cell.getAttribute('aria-disabled') === 'true'
+}
+
+/** Current view of the open picker: month grids expose aria-label
+ *  "month YYYY-MM"; day grids a "July 2026" header. */
+function currentPickerView(popup: HTMLElement): { year: number; month: number } | null {
+  const holder = popup.querySelector('[aria-label^="month "]')
+  const m = holder?.getAttribute('aria-label')?.match(/month (\d{4})-(\d{1,2})/)
+  if (m) return { year: parseInt(m[1], 10), month: parseInt(m[2], 10) }
+  const header = popup.querySelector('.react-datepicker__current-month')?.textContent ?? ''
+  const parsed = parseDateParts(header.trim())
+  return parsed ? { year: parseInt(parsed.year, 10), month: parseInt(parsed.month, 10) } : null
+}
+
+export async function fillReactDatePicker(
+  el: HTMLInputElement,
+  value: string,
+  signal?: SignalBundle,
+): Promise<FillOutcome> {
+  const parts = parseDateParts(value)
+  if (!parts) return 'failed'
+  const doc = el.ownerDocument
+  const year = parseInt(parts.year, 10)
+  const month = parseInt(parts.month, 10)
+
+  const verifyCommitted = async (): Promise<boolean> =>
+    !!(await pollFor(() => (el.value.trim() !== '' ? el : null), 1200))
+
+  // ---- Tier 1: drive the calendar popup --------------------------------------
+  // React re-mounts the popup DOM on year/month changes — NEVER hold element
+  // references across steps; re-query everything fresh each iteration, or the
+  // fill ends up clicking detached nodes (the "works only for the initial
+  // view year" failure).
+  const findPopup = () => doc.querySelector<HTMLElement>('.react-datepicker')
+  el.focus()
+  userClick(el)
+  if (await pollFor(findPopup, 2000)) {
+    const findCell = (): HTMLElement | null => {
+      const popup = findPopup()
+      if (!popup) return null
+      // Month-grid pickers show one year at a time; day grids one month —
+      // the target cell's own aria-label ("Choose May 2025") identifies it.
+      const monthGrid = !!popup.querySelector('.react-datepicker__month-text')
+      const targetDay = monthGrid ? undefined : parseInt(parts.day, 10)
+      return (
+        [...popup.querySelectorAll<HTMLElement>(
+          '.react-datepicker__month-text, .react-datepicker__day',
+        )].find((c) => {
+          const label = c.getAttribute('aria-label') ?? c.textContent ?? ''
+          return cellMatches(label, year, month, targetDay) && !c.className.includes('--outside-month')
+        }) ?? null
+      )
+    }
+    const view = () => {
+      const popup = findPopup()
+      return popup ? currentPickerView(popup) : null
+    }
+
+    let yearJumpTried = false
+    let reopens = 0
+    let lastViewKey = ''
+    let stalled = 0
+    for (let steps = 0; steps < 48; steps++) {
+      if (!findPopup()) {
+        // The site closed the popup mid-flight (outside-click handling etc.)
+        if (++reopens > 2) break
+        el.focus()
+        userClick(el)
+        if (!(await pollFor(findPopup, 1500))) break
+      }
+      const cell = findCell()
+      if (cell) {
+        if (isDisabledCell(cell)) break // out of the allowed range — chip, not guess
+        userClick(cell)
+        if (await verifyCommitted()) return 'filled'
+        break
+      }
+      // Custom headers (renderCustomHeader) often ship a native year <select> —
+      // one change event beats stepping across year boundaries click by click.
+      if (!yearJumpTried) {
+        yearJumpTried = true
+        const select = findPopup()?.querySelector('select')
+        const option =
+          select && [...select.options].find((o) => parseInt(o.value || o.text, 10) === year)
+        if (select && option) {
+          const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set
+          if (setter) setter.call(select, option.value)
+          else select.value = option.value
+          select.dispatchEvent(new Event('input', { bubbles: true }))
+          select.dispatchEvent(new Event('change', { bubbles: true }))
+          // Wait until the (possibly re-mounted) grid actually shows the year
+          await pollFor(() => (findCell() !== null || view()?.year === year ? true : null), 1200)
+          continue
+        }
+      }
+      const current = view()
+      if (!current) break
+      const viewKey = `${current.year}-${current.month}`
+      stalled = viewKey === lastViewKey ? stalled + 1 : 0
+      lastViewKey = viewKey
+      if (stalled >= 3) break // nav clicks aren't moving the view — dead end
+      const direction = year * 12 + month < current.year * 12 + current.month ? 'previous' : 'next'
+      const popup = findPopup()
+      // Stock arrows OR custom-header "Previous/Next Month" buttons
+      const nav =
+        popup?.querySelector<HTMLButtonElement>(`.react-datepicker__navigation--${direction}`) ??
+        (popup
+          ? [...popup.querySelectorAll<HTMLButtonElement>('button')].find((b) =>
+            new RegExp(direction, 'i').test(`${b.textContent} ${b.getAttribute('aria-label') ?? ''}`),
+          )
+          : undefined) ??
+        null
+      // Disabled nav = hard range boundary, never click through it
+      if (!nav || nav.disabled) break
+      userClick(nav)
+      await wait(120)
+    }
+  }
+
+  // ---- Tier 2: trusted typing (real user edit via CDP) ------------------------
+  const placeholder = signal?.placeholder || el.getAttribute('placeholder') || ''
+  const typedFormat = /dd|DD/.test(placeholder)
+    ? `${parts.month}/${parts.day}/${parts.year}`
+    : `${parts.month}/${parts.year}`
+  if (await trustedType(el, typedFormat)) {
+    el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    el.blur()
+    if (await verifyCommitted()) return 'filled'
+  }
+
+  el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  return 'failed'
+}
+
+/** Keyboard-protocol selection (ARIA combobox pattern): open with ArrowDown,
+ *  walk the widget's own highlight (aria-activedescendant) onto the target,
+ *  commit with Enter. The escape hatch for widgets that ignore synthetic
+ *  option clicks — the widget itself performs the selection. */
+async function keyboardSelect(
+  el: HTMLElement,
+  answerText: string,
+  optionSets: OptionSet[],
+): Promise<FillOutcome> {
+  const doc = el.ownerDocument
+  const keyTarget = () => (doc.activeElement instanceof HTMLElement ? doc.activeElement : el)
+  el.focus()
+  pressKey(keyTarget(), 'ArrowDown') // opens a closed listbox per the ARIA pattern
+  let options = await pollForOptions(doc, 1500)
+  if (options.length === 0) {
+    pressKey(keyTarget(), 'Enter')
+    options = await pollForOptions(doc, 1000)
+  }
+  if (options.length === 0) return 'failed'
+
+  const choice = chooseOption(asFieldOptions(options), answerText, optionSets)
+  if (!choice) {
+    pressKey(keyTarget(), 'Escape')
+    return 'failed'
+  }
+  const target = options[choice.index]
+  const listbox = target.closest<HTMLElement>('[role="listbox"]')
+  const activeDescId = (): string | null =>
+    listbox?.getAttribute('aria-activedescendant') ?? el.getAttribute('aria-activedescendant')
+  /** The highlight RESOLVED to an element — only trustworthy when the widget
+   *  gives its options ids (Workday assigns them lazily or not at all). */
+  const activeOption = (): HTMLElement | null => {
+    const id = activeDescId()
+    return id ? doc.getElementById(id) : null
+  }
+
+  const before = displayTextOf(el)
+  const initialDesc = activeDescId()
+  for (let step = 0; step < options.length + 2; step++) {
+    if (activeOption() === target) break
+    pressKey(keyTarget(), 'ArrowDown')
+    await wait(60)
+    if (!activeDescId()) break // widget doesn't expose its highlight at all
+  }
+  if (activeOption() !== target) {
+    // Typeahead with the FULL option text: two chars was ambiguous ("Un" →
+    // United Arab Emirates); "texas"/"united states" is not.
+    for (const ch of choice.text.toLowerCase().slice(0, 12)) pressKey(keyTarget(), ch)
+    await wait(150)
+  }
+  // Enter commits WHATEVER the widget has highlighted, so it needs evidence:
+  // - highlight resolves to our target → verified, commit;
+  // - highlight resolves to a DIFFERENT element → wrong, never commit
+  //   (the "Algeria" bug);
+  // - highlight is exposed but unresolvable (id-less Workday options): commit
+  //   only if it MOVED in response to our keys, then verify the display;
+  // - no highlight signal at all → the widget ignored us, never commit blind.
+  const resolved = activeOption()
+  const moved = activeDescId() !== initialDesc && activeDescId() !== null
+  const mayCommit = resolved === target || (resolved === null && moved)
+  if (!mayCommit) {
+    pressKey(keyTarget(), 'Escape')
+    return 'failed'
+  }
+  pressKey(keyTarget(), 'Enter')
+  await wait(150)
+  const after = displayTextOf(el)
+  if (after && after !== before && lexicalAnswerScore(after, choice.text) >= 0.5) return 'filled'
+  pressKey(keyTarget(), 'Escape')
+  return 'failed'
+}
+
+/** Filler words that make useless search queries on their own. */
+const SEARCH_STOPWORD_RE = /^(and|of|the|in|for|or|an?|with)$/i
+
+/** Broader single-word search terms for type-to-filter catalogs whose full
+ *  phrase found nothing: distinctive words of the answer, in answer order,
+ *  minus stopwords and terms already tried. Capped — every dead term costs a
+ *  full search-poll before the honest-failure tiers run. */
+function broadenedSearchTerms(answers: string[], alreadyTried: string[]): string[] {
+  const seen = new Set(alreadyTried.map((t) => t.toLowerCase()))
+  const terms: string[] = []
+  for (const answer of answers) {
+    for (const word of answer.split(/[^\p{L}\p{N}+#]+/u)) {
+      if (word.length < 4 || SEARCH_STOPWORD_RE.test(word)) continue
+      const key = word.toLowerCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      terms.push(word)
+    }
+  }
+  return terms.slice(0, 2)
+}
+
+/** Machinery buttons that must never be clicked as a popup trigger. */
+const NON_TRIGGER_BUTTON_RE = /help|clear|remove|delete|close|dismiss|info|tooltip/i
+
+/** The list-icon button riding a search-combobox (Workday multiselect ☰:
+ *  the popup opens from this SEPARATE button, not from the input). Looks
+ *  inside the widget first, then up a few wrapper levels — popup-hinted
+ *  buttons beat bare icon-only ones, and help/clear machinery never wins. */
+function adjacentDropdownTrigger(el: HTMLElement): HTMLElement | null {
+  const ownInput = el instanceof HTMLInputElement ? el : el.querySelector('input')
+  let scope: HTMLElement | null = el
+  for (let depth = 0; scope && depth < 4; depth++) {
+    // Walked out of this field's row: a wrapper holding OTHER fields'
+    // controls would offer their buttons as false triggers.
+    const foreignControl = [
+      ...scope.querySelectorAll<HTMLElement>('input:not([type="hidden"]), select, textarea'),
+    ].some((c) => c !== ownInput && c !== el)
+    if (foreignControl) return null
+    const candidates = [...scope.querySelectorAll<HTMLElement>('button, [role="button"]')].filter(
+      (btn) => {
+        if (btn === el || btn.contains(el)) return false
+        const purpose = `${btn.getAttribute('aria-label') ?? ''} ${btn.getAttribute('title') ?? ''} ${btn.getAttribute('data-automation-id') ?? ''}`
+        if (NON_TRIGGER_BUTTON_RE.test(purpose)) return false
+        const hasPopupHint = !!btn.getAttribute('aria-haspopup') || btn.hasAttribute('aria-expanded')
+        return hasPopupHint || (btn.textContent?.trim() ?? '') === ''
+      },
+    )
+    const hinted = candidates.find(
+      (btn) => !!btn.getAttribute('aria-haspopup') || btn.hasAttribute('aria-expanded'),
+    )
+    if (hinted) return hinted
+    if (candidates.length > 0) return candidates[0]
+    scope = scope.parentElement
+  }
+  return null
+}
+
+/** A category row that opens a sub-level, as opposed to a selectable leaf.
+ *  Deliberately conservative: clicking a leaf to "probe" would COMMIT a
+ *  wrong value, so exploration needs an explicit expandable hint. */
+function isExpandableOption(o: HTMLElement): boolean {
+  return (
+    !!o.getAttribute('aria-haspopup') ||
+    o.hasAttribute('aria-expanded') ||
+    !!o.querySelector('[class*="chevron"], [class*="expand"], [data-automation-id*="chevron"], [data-automation-id*="expand"]')
+  )
+}
+
+type ListWatch = { status: 'changed'; options: HTMLElement[] } | { status: 'settled' }
+
+/** After a click: did a different option list appear (sub-level), or did the
+ *  list close/stay put (selection committed)? Scoped to this widget's
+ *  options — a foreign always-in-DOM listbox must read as "closed".
+ *  `expectSublevel` (the clicked row carried an expandable hint): an empty
+ *  list means "old panel gone, sub-level still loading", never "committed" —
+ *  Workday fetches sub-options over the network after the panel swap. */
+async function watchListAfterClick(
+  doc: Document,
+  previousSignature: string,
+  timeoutMs: number,
+  scope: OptionScope = (all) => all,
+  expectSublevel = false,
+): Promise<ListWatch> {
+  const deadline = Date.now() + timeoutMs
+  let emptyStreak = 0
+  while (Date.now() < deadline) {
+    await wait(DROPDOWN_POLL_MS)
+    const options = scope(findDropdownOptions(doc, doc.location.hostname))
+    if (options.length === 0) {
+      if (!expectSublevel && ++emptyStreak >= 2) return { status: 'settled' } // list closed → committed
+      continue
+    }
+    emptyStreak = 0
+    if (optionSignature(options) !== previousSignature) return { status: 'changed', options }
+  }
+  return { status: 'settled' }
+}
+
+/** Fill-time inference input: the question and fact sheet the judge needs to
+ *  pick an option once the popup reveals the list (match.inferAtFill). */
+export interface DropdownInference {
+  question: string
+  factSheet: string
+}
+// (Despite the name, this now travels with EVERY custom-dropdown fill — the
+// hierarchical cascade judge needs the question even when a stored answer
+// exists. Per-level inference from the fact sheet still runs ONLY when there
+// is no stored answer; a stored answer keeps its anchored tiers.)
+
+/** Open the combobox, wait for its listbox, click the best-matching option.
+ *  Understands hierarchical prompts (Workday "How did you hear about us?"):
+ *  clicking a match that opens a sub-level keeps matching deeper — and when
+ *  the sub-level is page-branded ("Website" → "mcwane.com"), the company's
+ *  own option is chosen from the page context, since no stored answer can
+ *  name every company. When no top-level option matches, expandable
+ *  categories are explored one at a time. With `infer` set (no stored answer
+ *  at all), the semantic judge picks from the live option list instead.
+ *  Falls back to failed (→ chip). */
+export async function fillCustomDropdown(
+  el: HTMLElement,
+  answerText: string,
+  optionSets: OptionSet[] = [],
+  pageContext: PageContext | null = null,
+  answerFallbacks: string[] = [],
+  infer: DropdownInference | null = null,
+  /** Per-question judge routing (answerMode 'judge'): lexical picking is OFF
+   *  — the semantic tiers alone place the answer; declines chip honestly. */
+  judgeOnly = false,
+): Promise<FillResult> {
+  const doc = el.ownerDocument
+  const brand = brandTokens(pageContext, doc.location.hostname)
+  const initialDisplay = displayTextOf(el)
+  const answers = [answerText, ...answerFallbacks].filter((a) => a.trim() !== '')
+  // Snapshot BEFORE our first click: everything already in the DOM is some
+  // other widget's list (or this widget's, which aria/containment recovers)
+  const scope = makeOptionScope(doc, el)
+  /** Escalation tiers need a concrete answer string; the judge's pick (or a
+   *  primary answer) fills that role. */
+  let pickedText: string | null = null
+  const done = (outcome: FillOutcome): FillResult => ({
+    outcome,
+    filledText: outcome === 'filled' ? pickedText ?? (answers[0] ?? null) : null,
+  })
+  const openList = async (): Promise<HTMLElement[]> => {
+    el.focus()
+    userClick(el) // full pointer sequence — some widgets open on pointer/mousedown
+    // A multiselect search input never opens its list on click — don't burn
+    // the full timeout before the type-ahead/☰ paths that actually work.
+    const timeout =
+      el instanceof HTMLInputElement && el.closest(MULTISELECT_CONTAINER_SELECTOR)
+        ? 400
+        : DROPDOWN_TIMEOUT_MS
+    return pollForScopedOptions(doc, timeout, scope)
+  }
+  const closeList = () =>
+    el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+
+  /** Best answer placement on this level's options, alternates in order. */
+  const chooseAny = (fieldOptions: { value: string; text: string }[]) => {
+    for (const answer of answers) {
+      const choice = chooseOption(fieldOptions, answer, optionSets)
+      if (choice) return choice
+    }
+    return null
+  }
+
+  /** A click alone proves nothing — Workday can swallow synthetic option
+   *  clicks and leave "Select One" untouched while the list quietly closes.
+   *  Verify the trigger's display actually changed; if not, let the widget
+   *  select for us via its keyboard protocol. Honest 'failed' otherwise. */
+  const confirmSelection = async (clicked: HTMLElement): Promise<FillOutcome> => {
+    // No display signal (bare div triggers) — nothing to verify against
+    if (!initialDisplay) return 'filled'
+    // Multi-select prompts render choices as pills elsewhere; the trigger
+    // text staying put is normal, and re-selecting would TOGGLE the choice.
+    if (clicked.closest('[role="listbox"]')?.getAttribute('aria-multiselectable') === 'true')
+      return 'filled'
+    const deadline = Date.now() + 800
+    while (Date.now() < deadline) {
+      if (displayTextOf(el) !== initialDisplay) return 'filled'
+      await wait(DROPDOWN_POLL_MS)
+    }
+    // Synthetic click didn't register — keyboard protocol, then the trusted
+    // (chrome.debugger) tier: a real click the page can't ignore. The judge's
+    // picked text (inference) works as the answer for both tiers.
+    dropdownDebug('confirm', 'display unchanged after click — escalating')
+    const escalationAnswer = pickedText ?? answerText
+    const viaKeyboard = await keyboardSelect(el, escalationAnswer, optionSets)
+    dropdownDebug('keyboard', viaKeyboard)
+    if (viaKeyboard !== 'failed') return viaKeyboard
+    const viaTrusted = await trustedSelect(el, escalationAnswer, optionSets, initialDisplay)
+    dropdownDebug('trusted', `${viaTrusted}${viaTrusted === 'failed' ? ' (note: DevTools open blocks this tier)' : ''}`)
+    return viaTrusted
+  }
+
+  /** Type-to-filter tier (state/country pickers, Workday multiselect search
+   *  boxes, cx-select city catalogs): type each answer variant into the
+   *  trigger's input, then click a match on the FILTERED list. Runs when the
+   *  popup renders nothing — and again as a last resort when a populated
+   *  list had no placeable option (searchable catalogs open on a rendered
+   *  SUBSET: Oracle's city cx-select shows early alphabet only, "Houston"
+   *  exists solely behind the filter — live NOV gap 2026-07-17). */
+  let typeToFilterRan = false
+  const typeToFilterTier = async (longFirstSearch: boolean): Promise<FillResult | null> => {
+    if (typeToFilterRan) return null
+    const inputEl =
+      el instanceof HTMLInputElement
+        ? el
+        : el.querySelector<HTMLInputElement>('input:not([type="hidden"])')
+    if (!inputEl || answers.length === 0) return null
+    typeToFilterRan = true
+    // Workday multiselect: a committed choice renders as a PILL on the
+    // container while the search input clears — the pill is the commit
+    // signal, the input's value never is.
+    const pillHolder = inputEl.closest<HTMLElement>(MULTISELECT_CONTAINER_SELECTOR)
+    const pillsBefore = pillHolder?.textContent?.trim() ?? ''
+
+    /** Type one search term, reveal the filtered list, pick lexically —
+     *  then SEMANTICALLY (embeddings → judge, both decline-capable): when
+     *  the catalog spells the answer differently ("Industrial Engineering"
+     *  vs "Industrial and Systems Engineering"), the judge picks the
+     *  closest professional equivalent instead of giving up. Returns the
+     *  fill on verified success, null to try the next term. */
+    const typeaheadAttempt = async (term: string, enterPollMs: number): Promise<FillResult | null> => {
+      // Picking is only legal from a list the term actually CHANGED — the
+      // pre-typing options (possibly none) already failed to place.
+      const staleSignature = optionSignature(scope(findDropdownOptions(doc, doc.location.hostname)))
+      inputEl.focus()
+      setNativeValue(inputEl, term)
+      let typedOptions = await pollForFilteredOptions(doc, 1500, scope, staleSignature)
+      if (typedOptions.length === 0 && (pillHolder || !inputEl.form)) {
+        // Workday searches on ENTER — typing alone renders nothing. A
+        // synthetic Enter can never natively submit a form, and the
+        // pill-container/formless gate keeps page-level Enter handlers
+        // out of the blast radius on other ATSes.
+        pressKey(inputEl, 'Enter')
+        typedOptions = await pollForFilteredOptions(doc, enterPollMs, scope, staleSignature)
+        if (typedOptions.length > 0)
+          dropdownDebug('typeahead', `Enter-search for "${term}" → ${typedOptions.length} options`)
+      }
+      if (typedOptions.length === 0) return null
+      const fieldOptions = asFieldOptions(typedOptions)
+      let choice = judgeOnly ? null : chooseAny(fieldOptions)
+      if (!choice) {
+        choice = await semanticChooseOption(fieldOptions, answerText)
+        if (choice)
+          dropdownDebug('typeahead', `judge picked closest "${choice.text}" for "${answerText}"`)
+      }
+      if (!choice) return null
+      const clicked = typedOptions[choice.index]
+      pickedText = clicked.textContent?.trim() ?? null
+      dropdownDebug('typeahead', `typed "${term}" → clicking "${pickedText}"`)
+      clickOptionElement(clicked)
+      await wait(150)
+      // The committed text lives on the INPUT (div triggers have no value)
+      const display = displayTextOf(inputEl) || displayTextOf(el)
+      if (display && lexicalAnswerScore(display, pickedText ?? term) >= 0.5)
+        return done('filled')
+      if (pillHolder) {
+        const target = (pickedText ?? term).toLowerCase()
+        const deadline = Date.now() + 1200
+        while (Date.now() < deadline) {
+          const pills = pillHolder.textContent?.trim() ?? ''
+          if (
+            pills !== pillsBefore &&
+            (pills.toLowerCase().includes(target) || lexicalAnswerScore(pills, pickedText ?? term) >= 0.5)
+          ) {
+            setNativeValue(inputEl, '') // clear search residue
+            closeList() // multiselect popups stay open for more picks
+            return done('filled')
+          }
+          await wait(DROPDOWN_POLL_MS)
+        }
+      }
+      return null
+    }
+
+    // Full answers first; if no phrase reveals a clickable option, BROADEN
+    // the search word by word ("Industrial Engineering" finds nothing when
+    // the catalog says "Industrial and Systems Engineering" — "Industrial"
+    // reveals it, and lexical/semantic picking takes over from there).
+    const variants = answers.flatMap((a) => answerVariants(a))
+    const terms = [...variants, ...broadenedSearchTerms(answers, variants)]
+    for (let i = 0; i < terms.length; i++) {
+      // Only the FIRST Enter-search gets the full XHR window — a search
+      // that answered nothing once won't get slower for later terms (and a
+      // populated-list retry never gets it: those lists filter locally).
+      const result = await typeaheadAttempt(terms[i], longFirstSearch && i === 0 ? DROPDOWN_TIMEOUT_MS : 2500)
+      if (result) return result
+    }
+    setNativeValue(inputEl, '') // never leave filter residue behind
+    return null
+  }
+
+  let options = await openList()
+  dropdownDebug('open', `${options.length} scoped options (answer "${answerText || '<inference>'}")`)
+  if (options.length === 0) {
+    const typed = await typeToFilterTier(true)
+    if (typed) return typed
+    // The popup may open from a SEPARATE list-icon button next to the field
+    // (Workday multiselect ☰) — click it and match on whatever it reveals.
+    const trigger = adjacentDropdownTrigger(el)
+    if (trigger) {
+      dropdownDebug('trigger', 'clicking adjacent list button')
+      userClick(trigger)
+      options = await pollForScopedOptions(doc, DROPDOWN_TIMEOUT_MS, scope)
+    }
+    if (options.length === 0) {
+      if (answers.length === 0 || judgeOnly) {
+        // Judge-routed questions never fall to the keyboard/trusted tiers —
+        // both walk options LEXICALLY, which is exactly what 'judge' forbids.
+        closeList()
+        return done('failed')
+      }
+      // Popup may be open-but-loading — close it, then escalate: keyboard
+      // route first, REAL trusted clicks last.
+      const viaKeyboard = await keyboardSelect(el, answerText, optionSets)
+      dropdownDebug('keyboard', viaKeyboard)
+      if (viaKeyboard !== 'failed') return done(viaKeyboard)
+      const viaTrusted = await trustedSelect(el, answerText, optionSets, initialDisplay)
+      dropdownDebug('trusted', `${viaTrusted}${viaTrusted === 'failed' ? ' (note: DevTools open blocks this tier)' : ''}`)
+      if (viaTrusted === 'failed') closeList()
+      return done(viaTrusted)
+    }
+  }
+
+  // Direct descent: click best matches while they keep opening deeper levels
+  // (same matching brain as match time — intent-aware, Section 8)
+  for (let depth = 0; depth < MAX_PROMPT_DEPTH; depth++) {
+    const fieldOptions = asFieldOptions(options)
+    const choice = judgeOnly ? null : chooseAny(fieldOptions)
+    let clickIndex = choice?.index
+    if (clickIndex === undefined && depth > 0) {
+      // Sub-level under an already-matched category: the stored answer chose
+      // the branch ("Website"); the leaf is page-specific ("mcwane.com") —
+      // take the company-branded option, or a lone option (the only choice).
+      // Deterministic page evidence, so it outranks the semantic tiers here.
+      clickIndex =
+        brandedOptionIndex(options.map((o) => o.textContent?.trim() ?? ''), brand) ??
+        (options.length === 1 ? 0 : undefined)
+    }
+    if (clickIndex === undefined && answers.length > 0) {
+      // Meaning-level fallback before giving up on this level
+      const semantic = await semanticChooseOption(fieldOptions, answerText)
+      if (semantic) clickIndex = semantic.index
+    }
+    if (clickIndex === undefined && infer && answers.length === 0) {
+      // No stored answer at all — the judge picks from the live list, or
+      // declines (→ honest failed → chip). Re-asked per sub-level.
+      const inferred = await semanticAnswerOption(infer.question, fieldOptions, infer.factSheet)
+      if (inferred) clickIndex = inferred.index
+    }
+    if (clickIndex === undefined) break
+    const signature = optionSignature(options)
+    const clicked = options[clickIndex]
+    pickedText = clicked.textContent?.trim() ?? null
+    const expectsSublevel = isExpandableOption(clicked)
+    dropdownDebug('pick', `depth ${depth}: clicking "${pickedText}" of ${options.length} options`)
+    clickOptionElement(clicked)
+    const after = await watchListAfterClick(
+      doc,
+      signature,
+      expectsSublevel ? SUBLEVEL_FETCH_TIMEOUT_MS : SUBLEVEL_TIMEOUT_MS,
+      scope,
+      expectsSublevel,
+    )
+    if (after.status === 'settled') {
+      const outcome = await confirmSelection(clicked)
+      // Multiselect popups stay open for further picks — leave the page clean
+      if (outcome === 'failed' || el.closest(MULTISELECT_CONTAINER_SELECTOR)) closeList()
+      return done(outcome)
+    }
+    options = after.options // a sub-level opened — match the answer in it
+  }
+
+  // No direct match: explore expandable categories. A stored answer is
+  // matched lexically inside each branch as it opens (offline, free), and
+  // every branch's sub-options are HARVESTED along the way — so when lexical
+  // exploration misses, ONE cascade-judge call over the full tree can pick
+  // the primary + sub-option combination ("How did you hear about us?":
+  // saved "LinkedIn" lives under a category that never mentions it).
+  // Inference (no stored answer) probes too, but only when a cascade judge
+  // is configured to consume the tree — probing clicks cost real popups.
+  const wantExplore = answers.length > 0 || (infer !== null && semanticCascadeAvailable())
+  const categoryTexts = !wantExplore
+    ? []
+    : options
+      .filter(isExpandableOption)
+      .map((o) => o.textContent?.trim() ?? '')
+      .slice(0, EXPLORE_CAP)
+  const harvested: CascadeCategory[] = []
+  let live = options
+  for (const categoryText of categoryTexts) {
+    if (live.length === 0 || !live.every((o) => o.isConnected)) {
+      closeList()
+      live = await openList()
+      if (live.length === 0) break
+    }
+    const category = live.find((o) => (o.textContent?.trim() ?? '') === categoryText)
+    if (!category) {
+      live = []
+      continue
+    }
+    const signature = optionSignature(live)
+    userClick(category)
+    // Category rows are expandable by construction — wait through the
+    // panel-swap + network fetch, or slow sub-levels harvest as empty
+    const after = await watchListAfterClick(doc, signature, SUBLEVEL_FETCH_TIMEOUT_MS, scope, true)
+    if (after.status !== 'changed') {
+      live = []
+      continue
+    }
+    const subOptions = asFieldOptions(after.options)
+    harvested.push({ label: categoryText, options: subOptions.map((o) => o.text) })
+    const subChoice = answers.length > 0 && !judgeOnly ? chooseAny(subOptions) : null
+    if (subChoice) {
+      const clicked = after.options[subChoice.index]
+      pickedText = clicked.textContent?.trim() ?? null
+      dropdownDebug('explore', `clicking "${pickedText}" under "${categoryText}"`)
+      clickOptionElement(clicked)
+      await watchListAfterClick(doc, optionSignature(after.options), SUBLEVEL_TIMEOUT_MS, scope)
+      const outcome = await confirmSelection(clicked)
+      if (outcome === 'failed') closeList()
+      return done(outcome)
+    }
+    live = [] // wrong branch — reopen fresh for the next category
+  }
+
+  // Cascade judge: the model sees every harvested category WITH its
+  // sub-options in one call and returns the combination — or declines
+  // (→ honest failed → chip). Navigation re-finds both levels by TEXT, and
+  // the display-verification tiers still guard the final click.
+  if (harvested.length > 0 && infer) {
+    const pick = await semanticCascadePath(infer.question, answers[0] ?? '', infer.factSheet, harvested)
+    if (pick) {
+      dropdownDebug('cascade', `judge picked "${pick.categoryText}" → "${pick.optionText}"`)
+      closeList()
+      const fresh = await openList()
+      const category = fresh.find((o) => (o.textContent?.trim() ?? '') === pick.categoryText)
+      if (category) {
+        const signature = optionSignature(fresh)
+        userClick(category)
+        const after = await watchListAfterClick(doc, signature, SUBLEVEL_FETCH_TIMEOUT_MS, scope, true)
+        if (after.status === 'changed') {
+          const target = after.options.find(
+            (o) => (o.textContent?.trim() ?? '') === pick.optionText,
+          )
+          if (target) {
+            pickedText = target.textContent?.trim() ?? null
+            clickOptionElement(target)
+            await watchListAfterClick(doc, optionSignature(after.options), SUBLEVEL_TIMEOUT_MS, scope)
+            const outcome = await confirmSelection(target)
+            if (outcome === 'failed') closeList()
+            return done(outcome)
+          }
+        }
+      }
+    }
+  }
+
+  // A populated list with no placeable option may still be SEARCHABLE —
+  // filter it before giving up (the tier no-ops if it already ran).
+  const typed = await typeToFilterTier(false)
+  if (typed) return typed
+  closeList()
+  return done('failed')
+}
+
+// ---- File uploads (Resume feature, 2026-07-17) ----------------------------------
+// Extensions can't read the user's disk, but a content script CAN populate a
+// file input from bytes it already holds: File + DataTransfer → input.files,
+// then real input/change events. Drag-drop-only widgets get a synthetic
+// DragEvent('drop') on the associated zone instead. Between the two,
+// virtually every ATS uploader is reachable; anything else fails honestly.
+
+/** Environment-dependent core, isolated for testability (jsdom has File but
+ *  not DataTransfer — tests install a shim; runtime feature-detects). */
+export function buildFileTransfer(file: File): DataTransfer | null {
+  if (typeof DataTransfer !== 'function') return null
+  try {
+    const dt = new DataTransfer()
+    dt.items.add(file)
+    return dt
+  } catch {
+    return null
+  }
+}
+
+/** The filename the input actually holds — '' when nothing stuck. */
+function attachedFileName(input: HTMLInputElement): string {
+  try {
+    return input.files && input.files.length > 0 ? input.files[0].name : ''
+  } catch {
+    return ''
+  }
+}
+
+/** The filename an upload zone RENDERS after a successful hand-off (ATSes
+ *  show a chip with the file's name). Shared by fill verification and the
+ *  validation layer (validate.ts reads, never writes). */
+export function uploadZoneFilename(zone: HTMLElement): string {
+  const named = zone.querySelector<HTMLElement>(
+    '[data-automation-id*="file" i][data-automation-id*="name" i], ' +
+    '[class*="file-name" i], [class*="filename" i], [class*="file_name" i]',
+  )
+  const text = named?.textContent?.trim()
+  if (text) return text
+  // Fallback: an extension-bearing token in the zone's text. Requires a word
+  // char right before the dot so accepted-format hints (".pdf, .docx") and
+  // "upload a .pdf" prose never read as an uploaded file.
+  const match = (zone.textContent ?? '').match(/[\w][\w\-.()[\]]*\.(pdf|docx?|txt|rtf|odt)\b/i)
+  return match ? match[0].trim() : ''
+}
+
+/** Case-insensitive containment either way — zones render "resume.pdf",
+ *  "resume.pdf (120 KB)", or a truncated middle. */
+function zoneShowsFilename(zone: HTMLElement, name: string): boolean {
+  const text = (zone.textContent ?? '').toLowerCase()
+  return name.trim() !== '' && text.includes(name.trim().toLowerCase())
+}
+
+/**
+ * Attach a stored document to a file input:
+ *   1. input.files = DataTransfer.files + input/change events
+ *   2. verify: input.files holds the file
+ *   3. else synthetic dragenter/dragover/drop on the upload zone, re-verify
+ *      (input.files OR the zone rendering the filename)
+ *   4. else honest 'failed' → chip
+ */
+export async function fillFileUpload(
+  field: DetectedField,
+  doc: DocumentPayload,
+): Promise<FillResult> {
+  const input = field.el as HTMLInputElement
+  const file = new File([doc.bytes as BlobPart], doc.name, { type: doc.mime })
+  const dt = buildFileTransfer(file)
+  if (!dt) return { outcome: 'failed', filledText: null }
+
+  try {
+    input.files = dt.files
+  } catch {
+    // Engines where .files is getter-only — the drop fallback still applies
+  }
+  input.dispatchEvent(new Event('input', { bubbles: true }))
+  input.dispatchEvent(new Event('change', { bubbles: true }))
+  await wait(150)
+  if (attachedFileName(input) === doc.name) return { outcome: 'filled', filledText: doc.name }
+
+  const zone = field.uploadZoneEl
+  if (zone && typeof DragEvent === 'function') {
+    // Some framework uploaders only listen to drop, never to change
+    try {
+      const init = { bubbles: true, cancelable: true, dataTransfer: dt }
+      zone.dispatchEvent(new DragEvent('dragenter', init))
+      zone.dispatchEvent(new DragEvent('dragover', init))
+      zone.dispatchEvent(new DragEvent('drop', init))
+    } catch {
+      return { outcome: 'failed', filledText: null }
+    }
+    await wait(400) // let the widget process the hand-off + render its chip
+    if (attachedFileName(input) === doc.name || zoneShowsFilename(zone, doc.name))
+      return { outcome: 'filled', filledText: doc.name }
+  }
+  return { outcome: 'failed', filledText: null }
+}
+
+// ---- Dispatcher ----------------------------------------------------------------
+
+/**
+ * Fill one detected field from a match whose variables are ALREADY resolved
+ * (`match.resolvedAnswer` set; the caller must handle unresolvedVars first —
+ * literal {{braces}} must never reach the page, Section 7).
+ */
+export async function fillField(
+  field: DetectedField,
+  match: MatchResult,
+  optionSets: OptionSet[] = [],
+  pageContext: PageContext | null = null,
+  opts: FillFieldOptions = {},
+): Promise<FillResult> {
+  const value = match.resolvedAnswer
+  const asResult = (outcome: FillOutcome): FillResult => ({
+    outcome,
+    filledText: outcome === 'filled' ? value : null,
+  })
+  if (value === null || /\{\{[\w.\s]+\}\}/.test(value)) return asResult('refused')
+  const { el, signal } = field
+  const fallbacks = match.answerFallbacks ?? []
+  // Consent boxes that reach here carry a STORED curated answer (matcher
+  // never infers consentLike) — they fill like any field (user decision
+  // 2026-07-14). Unanswered consent still only gets the manual-review flag.
+  const blockConsent = false
+
+  // Segmented date widget (Workday) — one logical field, several inputs
+  if (field.dateSegmentEls) return asResult(fillDateSegments(field.dateSegmentEls, value))
+
+  switch (signal.kind) {
+    case 'file':
+      // With a stored document the caller passes the bytes (resume feature);
+      // without one there is nothing to attach — the flag chip covers it.
+      if (opts.document) return fillFileUpload(field, opts.document)
+      return asResult('refused')
+    case 'text':
+    case 'email':
+    case 'tel':
+    case 'url':
+    case 'number':
+    case 'password':
+      return asResult(fillTextInput(el as HTMLInputElement, value, signal))
+    case 'date': {
+      if (signal.dateWidget === 'react-datepicker')
+        return asResult(await fillReactDatePicker(el as HTMLInputElement, value, signal))
+      const outcome = fillTextInput(el as HTMLInputElement, value, signal)
+      if (outcome !== 'filled') return asResult(outcome)
+      // Controlled components revert async — a synchronous check reports a
+      // false "filled" moments before the value vanishes. Re-verify.
+      await wait(250)
+      return asResult((el as HTMLInputElement).value.trim() === '' ? 'failed' : 'filled')
+    }
+    case 'textarea':
+      return asResult(fillTextInput(el as HTMLTextAreaElement, value, signal))
+    case 'select':
+      return asResult(
+        await fillSelect(
+          el as HTMLSelectElement,
+          match.chosenOptionValue,
+          value,
+          optionSets,
+          fallbacks,
+          match.judgeOnly ?? false,
+        ),
+      )
+    case 'radio':
+      // Pill groups are radio-shaped but input-less — clicks + aria-pressed
+      if (field.pillEls && field.pillEls.length > 0) {
+        const pill = await fillPillGroup(
+          field.pillEls,
+          match.chosenOptionValue,
+          value,
+          optionSets,
+          fallbacks,
+          match.judgeOnly ?? false,
+        )
+        // filledText = the pill that LANDED (validation compares the page
+        // against it; the stored wording may differ via a semantic bridge)
+        return {
+          outcome: pill.outcome,
+          filledText: pill.outcome === 'filled' ? pill.pickedText ?? value : null,
+        }
+      }
+      return asResult(
+        await fillRadioGroup(
+          field.groupEls ?? [el as HTMLInputElement],
+          match.chosenOptionValue,
+          value,
+          optionSets,
+          fallbacks,
+          match.judgeOnly ?? false,
+        ),
+      )
+    case 'checkbox':
+      // Multi-select pill group (checkbox semantics, zero native inputs)
+      if (field.pillEls && field.pillEls.length > 0) {
+        const pill = await fillPillGroup(
+          field.pillEls,
+          undefined,
+          value,
+          optionSets,
+          fallbacks,
+          match.judgeOnly ?? false,
+          true,
+        )
+        return {
+          outcome: pill.outcome,
+          filledText: pill.outcome === 'filled' ? pill.pickedText ?? value : null,
+        }
+      }
+      // Multi-select group: several boxes answering one question
+      if (field.groupEls && field.groupEls.length > 1)
+        return asResult(fillCheckboxGroup(field.groupEls, value, optionSets, blockConsent))
+      if (match.chosenOptionValue !== 'checked' && match.chosenOptionValue !== 'unchecked')
+        return asResult('refused')
+      return asResult(
+        fillCheckbox(el as HTMLInputElement, match.chosenOptionValue === 'checked', blockConsent),
+      )
+    case 'contenteditable':
+      return asResult(fillContentEditable(el, value))
+    case 'custom-dropdown':
+      // Judge context travels on EVERY dropdown fill: with a stored answer it
+      // powers only the hierarchical cascade (anchored to that answer); the
+      // per-level fact-sheet inference stays gated on having no answer.
+      return fillCustomDropdown(
+        el,
+        value,
+        optionSets,
+        pageContext,
+        fallbacks,
+        { question: signal.label || signal.normalizedQuestion, factSheet: opts.factSheet ?? '' },
+        match.judgeOnly ?? false,
+      )
+    default:
+      return asResult('failed')
+  }
+}

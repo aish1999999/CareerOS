@@ -1,0 +1,1083 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import {
+  POST_MIRROR_MIN_WORDS,
+  captureActiveTabPost,
+  checkComment,
+  draftComment,
+  getCommentSettings,
+  rememberTake,
+  saveComment,
+  type CommentReason,
+  type LinkedInPost,
+} from '@/lib/comments'
+
+// ---------------------------------------------------------------------------
+// Stage 9 — the LinkedIn comment panel. Bob types his view; one paid call turns
+// it into a comment on the post he is looking at; he copies it and posts it
+// with his own hand.
+//
+// Bob's rule, and the WHOLE rule (2026-09-07, his words): "The user provides
+// their views in a textbox then the comment must be drafted revolving around
+// the entire line (the user's views) with effective clarity, professionalism,
+// an perspective dependent, if the post is basic basic comment must be drafted
+// whereas if the post is intellectual intellectual comment must be drafted. In
+// simple words the tone of the comment should mirror the post."
+//
+// He was offered a ban list — no flattery openers, no hashtags, a length cap —
+// and chose the rule above instead. So this panel has NO length limit, NO
+// banned-phrase list and NO flattery check. There are exactly two refusals,
+// both the hub's (service/comments.py check()):
+//   * the comment's register does not mirror the post's, and
+//   * the draft dropped too much of his take.
+// Both are rendered with the measurement they are made of, because a refusal
+// whose basis the reader cannot see is just a machine saying no.
+//
+// What this panel does NOT do, and why it is written this way:
+//   * nothing is read from the open LinkedIn page until the human presses
+//     "Read this post" — the button IS the consent, and the panel says so
+//     before it is pressed. One read, through chrome.scripting: no observer,
+//     no interval, no listener;
+//   * nothing on LinkedIn is ever posted, clicked, opened or watched by code.
+//     There is no "post it" button here and never will be. The human copies
+//     the comment, posts it, and then tells this panel what they did;
+//   * an image post is NOT read by a model. Bob deferred the vision path, so
+//     when the page gives thin text the panel says exactly that, in the
+//     READER's own words, and offers a box to paste or type the post. It never
+//     guesses at a picture;
+//   * one paid call, on one button, that says so on its own face and asks
+//     first. Every check after it is free and runs on every edit.
+//
+// The pure half (envelope readers, measurement labels, the enabled/disabled
+// rules) is exported beside the component so the rules can be tested as plain
+// functions and the form can be rendered from fixtures.
+// ---------------------------------------------------------------------------
+
+/**
+ * Below this many words the hub will not judge the register at all — service/comments.py `check()`
+ * raises a `register` reason only when the post has 25 words or more, because a six-word post has no
+ * register to mirror. So it is also the line at which this panel stops pretending it read the post.
+ * Taken from lib/comments.ts rather than chosen again here: the number is the hub's, and every copy
+ * of it downstream is a quotation.
+ */
+export const MIRRORABLE_MIN_WORDS = POST_MIRROR_MIN_WORDS
+
+/**
+ * The share of the take a comment must carry before the hub stops refusing it
+ * (service/comments.py `MIN_COVERAGE`). Quoted here so the panel's own tick agrees with the
+ * refusal beneath it — two thresholds for one rule is how a green tick ends up above a red reason.
+ */
+export const MIN_TAKE_COVERAGE = 0.67
+
+export const REGISTER_LEVELS = ['plain', 'mixed', 'technical'] as const
+export type RegisterLevel = (typeof REGISTER_LEVELS)[number]
+
+/** One reason this comment may not be posted as written, and what to do about it — the hub's own
+ *  shape, used unchanged. A rule lives in one place or it drifts. */
+export type { CommentReason }
+
+// --- the shapes this panel holds -------------------------------------------
+// Everything arriving from the lib, the hub or the page reader is read through the tolerant
+// functions below rather than trusted: a panel that throws on an unexpected key would strand a
+// human mid-comment, and a panel that trusts a wrapper loses refusals (see readEnvelope).
+
+/** The post as the page reader saw it, reduced to what this screen renders. `thin` and `thinWhy` are
+ *  the READER's own verdict and reasoning, carried through rather than recomputed — the panel and
+ *  the reader must not be able to disagree about how good the read was. */
+export interface CapturedPost {
+  postUrl: string
+  author: string | null
+  authorUrl: string | null
+  text: string
+  words: number
+  /** Too little text for "mirror the post" to mean anything. Not a failure — it is the honest half
+   *  of the deferred vision path. */
+  thin: boolean
+  thinWhy: string | null
+  /** The page looked like a picture or a video post: the case vision would have covered. */
+  hasImage: boolean
+}
+
+/** How a piece of writing reads, as service/comments.py register() measured it. Numbers, not an
+ *  opinion — this is what the mirror refusal is made of. */
+export interface RegisterReading {
+  words: number
+  sentences: number
+  wordsPerSentence: number
+  longWordShare: number
+  acronyms: number
+  numbers: number
+  level: RegisterLevel
+  score: number
+}
+
+/** How much of the take the comment carries, as service/comments.py coverage() measured it. */
+export interface CoverageReading {
+  terms: string[]
+  carried: string[]
+  dropped: string[]
+  share: number
+}
+
+/** The hub's verdict on a comment — drafted or typed, it faces the same two checks. */
+export interface CommentGate {
+  ok: boolean
+  text: string
+  chars: number
+  reasons: CommentReason[]
+  postRegister: RegisterReading | null
+  commentRegister: RegisterReading | null
+  coverage: CoverageReading | null
+  /** Only the paid draft carries these. A free check spends nothing and reports nothing. */
+  costUsd: number | null
+  model: string | null
+}
+
+/** What the lib wrapped an answer in: a status, a sentence, and the payload somewhere inside. */
+export interface Envelope {
+  status: string
+  note: string
+  payload: Record<string, unknown> | null
+}
+
+// --- tolerant readers, all pure ---------------------------------------------
+
+function asRecord(raw: unknown): Record<string, unknown> | null {
+  return raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : null
+}
+
+function pickString(source: Record<string, unknown>, ...keys: string[]): string | null {
+  for (const key of keys) {
+    const value = source[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return null
+}
+
+function pickNumber(source: Record<string, unknown>, ...keys: string[]): number | null {
+  for (const key of keys) {
+    const value = source[key]
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+  return null
+}
+
+function pickBool(source: Record<string, unknown>, ...keys: string[]): boolean {
+  for (const key of keys) if (source[key] === true) return true
+  return false
+}
+
+function pickStrings(source: Record<string, unknown>, ...keys: string[]): string[] {
+  for (const key of keys) {
+    const value = source[key]
+    if (!Array.isArray(value)) continue
+    return value.filter((entry): entry is string => typeof entry === 'string' && !!entry.trim())
+  }
+  return []
+}
+
+/** Keys that only ever appear on a gate, used to tell a spread payload from its wrapper. */
+const GATE_KEYS = ['ok', 'reasons', 'register', 'coverage', 'chars', 'text']
+
+/**
+ * THE ONE THAT MATTERS. lib/comments.ts answers in an ENVELOPE — `{status, note, draft}` from the
+ * paid call, `{status, note, check}` from the free one — and the gate is INSIDE it.
+ *
+ * In Stage 8 a panel read the envelope as though it were the payload. Every refusal the hub sent was
+ * silently dropped, the reasons list came back empty, and a note the hub had REFUSED reached the
+ * send button looking clean. That is the bug this function exists to make impossible: unwrap first,
+ * always, and when nothing gate-shaped is inside, say payload = null rather than pretending the
+ * wrapper is a verdict.
+ */
+export function readEnvelope(raw: unknown): Envelope {
+  const outer = asRecord(raw)
+  if (!outer) return { status: 'error', note: '', payload: null }
+  const nested = asRecord(outer.draft) ?? asRecord(outer.check) ?? asRecord(outer.result)
+    ?? asRecord(outer.gate) ?? asRecord(outer.comment)
+  // A lib that spreads the payload into the envelope leaves the gate keys on the outside; a lib that
+  // nests it leaves `draft`/`check` there. Both are read, and neither is guessed at: an outer object
+  // with no gate key on it and nothing gate-shaped within carries no verdict at all.
+  const flat = GATE_KEYS.some((key) => key in outer) ? outer : null
+  const payload = nested ?? flat
+  const status = pickString(outer, 'status') ?? (payload ? 'sent' : 'error')
+  return { status, note: pickString(outer, 'note') ?? '', payload }
+}
+
+/** One `register()` reading. Null when the hub sent nothing measurable — never a zeroed stand-in
+ *  that would read on screen as "measured, and plain". */
+export function readRegister(raw: unknown): RegisterReading | null {
+  const source = asRecord(raw)
+  if (!source) return null
+  const levelRaw = pickString(source, 'level')
+  const level = REGISTER_LEVELS.find((option) => option === levelRaw)
+  const words = pickNumber(source, 'words')
+  if (!level || words === null) return null
+  return {
+    words,
+    sentences: pickNumber(source, 'sentences') ?? 0,
+    wordsPerSentence: pickNumber(source, 'wordsPerSentence', 'words_per_sentence') ?? 0,
+    longWordShare: pickNumber(source, 'longWordShare', 'long_word_share') ?? 0,
+    acronyms: pickNumber(source, 'acronyms') ?? 0,
+    numbers: pickNumber(source, 'numbers') ?? 0,
+    level,
+    score: pickNumber(source, 'score') ?? 0,
+  }
+}
+
+/** One `coverage()` reading. Null rather than an invented 100%: "not measured" and "nothing was
+ *  dropped" are different things and must not look the same on screen. */
+export function readCoverage(raw: unknown): CoverageReading | null {
+  const source = asRecord(raw)
+  if (!source) return null
+  const share = pickNumber(source, 'share')
+  if (share === null) return null
+  return {
+    terms: pickStrings(source, 'terms'),
+    carried: pickStrings(source, 'carried'),
+    dropped: pickStrings(source, 'dropped'),
+    share,
+  }
+}
+
+/**
+ * The hub's verdict, out of whatever the lib wrapped it in. `fallbackText` keeps the human's own
+ * words on screen when the hub answered without echoing them back.
+ *
+ * `ok` is true only when the hub SAID ok and listed no reasons. A missing payload is not consent.
+ */
+export function readGate(raw: unknown, fallbackText = ''): CommentGate {
+  const { payload } = readEnvelope(raw)
+  const source = payload ?? {}
+  const reasons: CommentReason[] = []
+  if (Array.isArray(source.reasons)) {
+    for (const entry of source.reasons) {
+      const reason = asRecord(entry)
+      if (!reason) continue
+      reasons.push({
+        code: pickString(reason, 'code') ?? 'refused',
+        detail: pickString(reason, 'detail') ?? 'the hub refused this comment',
+        fix: pickString(reason, 'fix') ?? 'edit the comment and it will be checked again',
+      })
+    }
+  }
+  const registers = asRecord(source.register)
+  const text = pickString(source, 'text') ?? fallbackText
+  return {
+    ok: payload !== null && source.ok === true && reasons.length === 0,
+    text,
+    chars: pickNumber(source, 'chars') ?? text.length,
+    reasons,
+    postRegister: readRegister(registers?.post),
+    commentRegister: readRegister(registers?.comment),
+    coverage: readCoverage(source.coverage),
+    costUsd: pickNumber(source, 'costUsd', 'cost_usd'),
+    model: pickString(source, 'model'),
+  }
+}
+
+/**
+ * The post as the reader returned it, out of its own `{status, note, post}` envelope. Returns null
+ * for `post` when there is nothing post-shaped there — the panel then says what the reader said
+ * rather than showing an empty card that looks like a read.
+ */
+export function readPostCapture(raw: unknown): { status: string; note: string; post: CapturedPost | null } {
+  const outer = asRecord(raw)
+  if (!outer) return { status: 'error', note: '', post: null }
+  // The post is inside `post` or it was not read. NEVER fall back to the envelope: a refusal carries
+  // the tab's own `url`, so reading the wrapper would turn "that is not a LinkedIn post" into a
+  // post keyed on whatever tab happened to be open — the same envelope mistake Stage 8 made with a
+  // gate, which is why every reader here unwraps and none of them guesses.
+  const source = asRecord(outer.post)
+  const postUrl = source ? pickString(source, 'postUrl', 'post_url', 'url') ?? '' : ''
+  const text = source ? pickString(source, 'text', 'postText', 'post_text', 'body') ?? '' : ''
+  const status = pickString(outer, 'status') ?? 'sent'
+  const note = pickString(outer, 'note') ?? ''
+  if (!source || (!postUrl && !text)) return { status, note, post: null }
+  return {
+    status,
+    note,
+    post: {
+      postUrl,
+      author: pickString(source, 'author', 'postAuthor', 'post_author', 'authorName'),
+      authorUrl: pickString(source, 'authorUrl', 'postAuthorUrl', 'post_author_url'),
+      text,
+      words: pickNumber(source, 'words') ?? countWords(text),
+      // No text at all is thin whatever the reader said — that is the image-post case Bob deferred
+      // the vision path for, and it has to survive to the screen intact.
+      thin: pickBool(source, 'thin') || !text,
+      thinWhy: pickString(source, 'thinWhy', 'thin_why'),
+      hasImage: pickBool(source, 'hasImage', 'has_image', 'imageOnly', 'image_only'),
+    },
+  }
+}
+
+/** What the write came to. Only a write that actually landed may latch the button. */
+export function readOutcome(raw: unknown): { status: string; note: string; id: string | null } {
+  const outer = asRecord(raw)
+  if (!outer) return { status: 'error', note: '', id: null }
+  const nested = asRecord(outer.row) ?? asRecord(outer.record)
+  return {
+    status: pickString(outer, 'status') ?? 'error',
+    note: pickString(outer, 'note') ?? '',
+    id: pickString(outer, 'commentId', 'comment_id', 'id') ?? (nested ? pickString(nested, 'id') : null),
+  }
+}
+
+// --- the measurements, in words ---------------------------------------------
+
+// Mirrors service/comments.py WORD, so the panel's "N words" and the hub's are the same count.
+const WORD_RE = /[A-Za-z][A-Za-z'’-]*/g
+
+/** How many words a piece of text has, counted the way the hub counts them. */
+export function countWords(text: string): number {
+  return (text || '').match(WORD_RE)?.length ?? 0
+}
+
+/** How far two registers are apart, in buckets — 0 mirrors, 2 is the whole range. The hub refuses at
+ *  2; this is here to LABEL that, not to decide it. */
+export function registerDistance(a: RegisterLevel, b: RegisterLevel): number {
+  return Math.abs(REGISTER_LEVELS.indexOf(a) - REGISTER_LEVELS.indexOf(b))
+}
+
+const REGISTER_BLURB: Record<RegisterLevel, string> = {
+  plain: 'plain — short sentences, everyday words',
+  mixed: 'mixed — some detail, nothing specialist',
+  technical: 'technical — long sentences, long words, acronyms or figures',
+}
+
+/** What a level means, spelled out. A one-word bucket the reader cannot interpret explains nothing. */
+export function registerLabel(level: RegisterLevel): string {
+  return REGISTER_BLURB[level] ?? String(level)
+}
+
+function percent(share: number): number {
+  return Math.round(share * 100)
+}
+
+function readingNumbers(reading: RegisterReading): string {
+  return `${reading.wordsPerSentence} words a sentence, ${percent(reading.longWordShare)}% long words`
+    + (reading.acronyms + reading.numbers > 0 ? `, ${reading.acronyms + reading.numbers} acronyms or figures` : '')
+}
+
+export interface MeasurementLine {
+  /** true = this measurement is fine, false = this is what a refusal is made of, null = not measured. */
+  ok: boolean | null
+  text: string
+  detail: string
+}
+
+/**
+ * Bob's first rule as a sentence: does the comment read like the post. Both readings are quoted, so
+ * a refusal can be argued with — and so a PASS can be checked too, which is the half a panel that
+ * only shows failures never lets you see.
+ */
+export function mirrorLine(post: RegisterReading | null, comment: RegisterReading | null): MeasurementLine {
+  if (!post || !comment) {
+    return {
+      ok: null,
+      text: 'Register: not measured yet.',
+      detail: 'The hub measures the post and the comment together, free, as soon as there is a comment to measure.',
+    }
+  }
+  const detail = `The post: ${readingNumbers(post)}. This comment: ${readingNumbers(comment)}.`
+  if (post.words < MIRRORABLE_MIN_WORDS) {
+    return {
+      ok: null,
+      text: `Register: the post is only ${post.words} words — too short to have one, so nothing is claimed `
+        + 'about mirroring it. If the real post is longer than that, paste it above.',
+      detail,
+    }
+  }
+  const apart = registerDistance(post.level, comment.level)
+  if (apart === 0) {
+    return { ok: true, text: `Register: the post reads ${registerLabel(post.level)}, and so does this comment. It mirrors.`, detail }
+  }
+  if (apart === 1) {
+    return {
+      ok: true,
+      text: `Register: the post reads ${post.level}, this comment reads ${comment.level} — one step apart, which passes.`,
+      detail,
+    }
+  }
+  return {
+    ok: false,
+    text: `Register: the post reads ${post.level} and this comment reads ${comment.level} — the whole range apart. `
+      + 'That is the mirror refusal below.',
+    detail,
+  }
+}
+
+function listOf(words: string[], limit = 8): string {
+  if (words.length <= limit) return words.join(', ')
+  return `${words.slice(0, limit).join(', ')} and ${words.length - limit} more`
+}
+
+/**
+ * Bob's second rule as a sentence: how much of his take the comment actually carries, and what went
+ * missing. The share is the hub's own number; whether it is low enough to refuse is the hub's call
+ * and shows up in the reasons list, not here.
+ */
+export function coverageLine(coverage: CoverageReading | null): MeasurementLine {
+  if (!coverage) {
+    return {
+      ok: null,
+      text: 'Your take in the comment: not measured yet.',
+      detail: 'Every distinctive word of yours that the post did not already supply is looked for in the comment.',
+    }
+  }
+  if (coverage.terms.length === 0) {
+    return {
+      ok: null,
+      text: 'Your take in the comment: your view used no distinctive words of its own beyond the post\'s, so there is nothing to lose.',
+      detail: 'Coverage only counts the words the post did NOT supply — repeating the post would otherwise score well while saying nothing of yours.',
+    }
+  }
+  const carried = `it carries ${listOf(coverage.carried)}`
+  if (coverage.dropped.length === 0) {
+    return {
+      ok: true,
+      text: `Your take in the comment: all of it — ${carried}.`,
+      detail: `Measured on the ${coverage.terms.length} words of yours the post did not already supply.`,
+    }
+  }
+  return {
+    // The hub's own threshold, not a second one: it refuses below two thirds carried
+    // (service/comments.py MIN_COVERAGE), so a tick here at four of six would sit directly above its
+    // refusal of the same number. One rule, one line, quoted rather than re-chosen.
+    ok: coverage.share >= MIN_TAKE_COVERAGE,
+    text: `Your take in the comment: ${percent(coverage.share)}% — ${carried}; it leaves out ${listOf(coverage.dropped)}.`,
+    detail: `Measured on the ${coverage.terms.length} words of yours the post did not already supply.`,
+  }
+}
+
+// --- what the comment is measured against -----------------------------------
+
+export interface PostTextState {
+  /** The text the hub is given: what the human pasted if they pasted anything, else what the page gave. */
+  text: string
+  source: 'typed' | 'page' | 'none'
+  /** The page's read is not enough to mirror a register — say so, and offer the box. */
+  thin: boolean
+  why: string
+}
+
+const PASTE_INSTEAD_OF_VISION = 'Reading pictures is deliberately not built here, so nothing was guessed. '
+  + 'Paste or type the post below and everything works normally.'
+
+/**
+ * Which post text the checks are run against, and whether it is worth anything.
+ *
+ * The vision path is deliberately NOT built (Bob, 2026-09-07): an image post is never sent to a model
+ * to be described. So when the page gives nothing, or gives too little to have a register, this says
+ * exactly that — in the READER's own words where it gave a reason, and in the panel's where it did
+ * not. A typed post always wins over the page's: the human is the better reader.
+ */
+export function postTextState(post: CapturedPost | null, pasted: string): PostTextState {
+  const typed = (pasted || '').trim()
+  if (typed) {
+    const words = countWords(typed)
+    return {
+      text: typed,
+      source: 'typed',
+      thin: words < MIRRORABLE_MIN_WORDS,
+      why: words < MIRRORABLE_MIN_WORDS
+        ? `This is the post text you pasted — ${words} words, which is under the ${MIRRORABLE_MIN_WORDS} `
+          + 'the hub needs before it will claim anything about the post\'s register.'
+        : 'This is the post text you pasted, and it is what the comment is measured against.',
+    }
+  }
+  if (!post) {
+    return {
+      text: '',
+      source: 'none',
+      thin: true,
+      why: 'No post has been read yet. Press Read this post on the post\'s own tab, or paste the post below.',
+    }
+  }
+  const page = post.text.trim()
+  if (!page) {
+    return {
+      text: '',
+      source: 'none',
+      thin: true,
+      why: `${post.thinWhy ?? (post.hasImage
+        ? 'The page gave no text for this post — it is an image, a video or a document card.'
+        : 'The page gave no text for this post.')} ${PASTE_INSTEAD_OF_VISION}`,
+    }
+  }
+  if (post.thin) {
+    return {
+      text: page,
+      source: 'page',
+      thin: true,
+      why: `${post.thinWhy ?? `The page gave only ${post.words} words — under the ${MIRRORABLE_MIN_WORDS} the hub `
+        + 'needs before it will claim anything about the post\'s register.'} `
+        + 'If the real post is longer than that, or the page cut it off at a "see more", paste it below and '
+        + 'yours is used instead.',
+    }
+  }
+  return {
+    text: page,
+    source: 'page',
+    thin: false,
+    why: `Read from the page: ${post.words} words. If that is not the whole post, paste it below and yours is used instead.`,
+  }
+}
+
+// --- the rules, as plain functions -----------------------------------------
+
+/** Draft is the ONLY spend on this screen, so it says so on its own face and is offered only where
+ *  it can do anything: there has to be a view for it to write. */
+export function draftState(input: { take: string; postText: string; busy: boolean }): { enabled: boolean; why: string } {
+  if (input.busy) return { enabled: false, why: 'Working — wait for the current step to finish.' }
+  if (!input.take.trim()) {
+    return {
+      enabled: false,
+      why: 'Type your view first. The comment is YOUR view written out — the model supplies no opinion of its own, '
+        + 'so with nothing in that box there is nothing to write.',
+    }
+  }
+  const noPost = !input.postText.trim()
+  return {
+    enabled: true,
+    why: 'Spends money: one short model call writes your whole view as a comment on this post. It asks before it '
+      + 'spends, keeps everything you typed either way, and the result faces the same two checks a comment you '
+      + 'typed yourself would. Nothing is posted to LinkedIn — you copy it and post it.'
+      + (noPost
+        ? ' There is no post text yet, so there is no register to mirror: it will be written from your view alone.'
+        : ''),
+  }
+}
+
+export interface PostedState {
+  text: string
+  checked: boolean
+  reasons: CommentReason[]
+  postUrl: string
+  busy: boolean
+  postedAt: string | null
+}
+
+/**
+ * Every reason "I posted it" is dead. Empty means it is alive.
+ *
+ * The button is never alive on an unchecked comment: if the hub could not be reached the comment was
+ * not measured, and logging an unmeasured comment as though it had passed is exactly the silent
+ * fallback this project refuses. Each hub refusal is repeated here with its fix, in the hub's own
+ * words — nothing is invented and nothing is suppressed.
+ *
+ * The post URL is a blocker because `comments` has no key: lib/comments.ts files the row under the
+ * canonical post address and refuses without one. Better a dead button that says why than a press
+ * that fails.
+ */
+export function postedBlockers(state: PostedState): string[] {
+  const blockers: string[] = []
+  if (state.postedAt) blockers.push('this comment is already logged as posted')
+  if (!state.text.trim()) blockers.push('there is no comment yet')
+  if (!state.postUrl.trim()) {
+    blockers.push('no post URL was read — a comment is filed under the post\'s address, so press Read this post on the post\'s own tab')
+  }
+  if (!state.checked) blockers.push('the hub has not checked this comment yet')
+  for (const reason of state.reasons) blockers.push(`${reason.detail} — ${reason.fix}`)
+  if (state.busy) blockers.push('working…')
+  return blockers
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+// --- the pure form ----------------------------------------------------------
+
+export interface CommentFormProps {
+  post: CapturedPost | null
+  postText: PostTextState
+  pastedPost: string
+  take: string
+  text: string
+  gate: CommentGate | null
+  mirror: MeasurementLine
+  coverage: MeasurementLine
+  draft: { enabled: boolean; why: string }
+  blockers: string[]
+  reading: boolean
+  drafting: boolean
+  checking: boolean
+  logging: boolean
+  drafted: boolean
+  edited: boolean
+  postedAt: string | null
+  status: string | null
+  on: {
+    read: () => void
+    setPastedPost: (value: string) => void
+    setTake: (value: string) => void
+    draft: () => void
+    setText: (value: string) => void
+    copy: () => void
+    logPosted: () => void
+  }
+}
+
+/**
+ * Everything the panel shows, with nothing of its own to fetch or remember. The container below owns
+ * the state; this half renders from fixtures, which is how the refusals are tested.
+ */
+export function CommentForm(props: CommentFormProps) {
+  const { post, postText, gate, on } = props
+  const busy = props.reading || props.drafting || props.logging
+
+  return (
+    <div data-testid="comment-panel">
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <strong>LinkedIn comment</strong>
+        <span className="chip gray" title="Nothing here opens, watches, clicks, posts or comments on LinkedIn.">
+          you post it, we log it
+        </span>
+      </div>
+
+      {/* ---- 1. consent: nothing runs on LinkedIn until this is pressed ----- */}
+      <div className="btn-row">
+        <button className="btn small primary" disabled={busy} onClick={on.read}
+          title="Reads the post in the active tab once. It clicks nothing, opens nothing and posts nothing.">
+          {props.reading ? 'Reading…' : post ? 'Read this post again' : 'Read this post'}
+        </button>
+      </div>
+      <div className="sub">
+        Nothing runs on LinkedIn until you press this, and then it runs once: the page is read, never
+        written to. Nothing on LinkedIn is ever clicked, opened, watched or posted by this extension —
+        you post the comment yourself.
+      </div>
+
+      {/* ---- 2. the post as read -------------------------------------------- */}
+      {post && (
+        <div className="note" style={{ marginTop: 8 }} data-testid="comment-post">
+          <div>
+            <strong>{post.author ?? 'author not read'}</strong>
+            {post.authorUrl ? <span className="sub"> · {post.authorUrl}</span> : null}
+          </div>
+          <div className="sub">{post.postUrl || 'no post URL read'}</div>
+          <div className="sub">
+            {post.words} words · {post.text.length} characters read from the page
+            {post.thin ? ' · too little to mirror' : ''}
+            {post.hasImage ? ' · the page had a picture or a video' : ''}
+          </div>
+          {post.text && (
+            <div style={{ marginTop: 6, maxHeight: 160, overflowY: 'auto', whiteSpace: 'pre-wrap', fontSize: 12 }}>
+              {post.text}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ---- 3. the thin read, said plainly, with the box Bob chose over vision.
+           Only after a read: before one, "the page did not give the full post" would be a claim about
+           a page nothing has looked at. */}
+      {post && postText.thin && postText.source !== 'typed' && (
+        <div className="warn" data-testid="comment-thin">
+          <strong>The page did not give the full post.</strong> {postText.why}
+        </div>
+      )}
+      <div className="field" style={{ marginTop: 8 }}>
+        <label>The post text {postText.source === 'typed' ? '· yours, used instead of the page\'s' : '· from the page'}</label>
+        <textarea value={props.pastedPost} onChange={(e) => on.setPastedPost(e.target.value)}
+          placeholder="Paste or type the post here. Anything you put in this box is what the comment is measured against." />
+        <div className="sub">
+          {postText.source === 'typed'
+            ? postText.why
+            : 'Leave this empty to use what the page gave. Reading images is deliberately not built here, so an '
+              + 'image post is pasted, never guessed at.'}
+        </div>
+      </div>
+
+      {/* ---- 4. the whole point: his view ----------------------------------- */}
+      <div className="field" style={{ marginTop: 10 }}>
+        <label>Your view — the comment is built around this whole line</label>
+        <textarea value={props.take} onChange={(e) => on.setTake(e.target.value)}
+          placeholder="What you actually think about this post, in your own words. Say all of it." />
+        <div className="sub">
+          The comment revolves around your entire view, not a convenient part of it — and the hub measures
+          whether it did. Nothing here has an opinion of its own; the model only writes yours out. Kept on
+          this machine as you type, so closing the popup does not lose it.
+        </div>
+      </div>
+
+      {/* ---- 5. the one paid button ----------------------------------------- */}
+      <div className="btn-row">
+        <button className="btn small primary" disabled={!props.draft.enabled} onClick={on.draft}
+          data-testid="comment-draft" title={props.draft.why}>
+          {props.drafting ? 'Drafting…' : props.drafted ? 'Draft it again (spends money)' : 'Draft it (spends money)'}
+        </button>
+        <span className="sub" style={{ flex: 1 }}>
+          The only thing on this screen that spends. Every check after it is free.
+        </span>
+      </div>
+
+      {/* ---- 6. the comment, freely editable, re-checked free on every edit -- */}
+      <div className="field" style={{ marginTop: 10 }}>
+        <label>The comment{props.edited ? ' · your edit' : props.drafted ? ' · as drafted' : ''}</label>
+        <textarea value={props.text} onChange={(e) => on.setText(e.target.value)}
+          placeholder={props.drafting ? 'Drafting…' : 'The drafted comment appears here — edit it freely, or write your own.'} />
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <span className="sub" data-testid="comment-count">{props.text.length} characters</span>
+          {props.checking && <span className="sub">checking…</span>}
+        </div>
+        <div className="sub">
+          Every edit is re-checked here against the two rules, free. Editing costs nothing and is never
+          sent to a model.
+        </div>
+      </div>
+
+      {/* ---- 7. the two measurements the refusals are MADE of ---------------- */}
+      <div className="note" data-testid="comment-measurements">
+        <div className="sub" data-testid="comment-register">
+          <strong>{props.mirror.ok === false ? '✕ ' : props.mirror.ok === true ? '✓ ' : '· '}</strong>
+          {props.mirror.text}
+          {props.mirror.detail ? <div className="sub">{props.mirror.detail}</div> : null}
+        </div>
+        <div className="sub" style={{ marginTop: 6 }} data-testid="comment-coverage">
+          <strong>{props.coverage.ok === false ? '✕ ' : props.coverage.ok === true ? '✓ ' : '· '}</strong>
+          {props.coverage.text}
+          {props.coverage.detail ? <div className="sub">{props.coverage.detail}</div> : null}
+        </div>
+        <div className="sub" style={{ marginTop: 6 }}>
+          These two numbers are the whole rule: the comment must read like the post, and it must carry your
+          whole view. Nothing else is refused here — no length cap, no banned words.
+        </div>
+      </div>
+
+      {/* the refusal, in the hub's words, with its fix — never a silent rewrite */}
+      {gate && gate.reasons.length > 0 && (
+        <div className="warn" data-testid="comment-reasons">
+          <strong>Not ready to post as written:</strong>
+          <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
+            {gate.reasons.map((reason, i) => (
+              <li key={`${reason.code}-${i}`}>{reason.detail} — <em>{reason.fix}</em></li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {/* Only while the verdict is about the text actually on screen: `blockers` carries the "not
+          checked yet" that a mid-edit re-check puts back, so this line cannot outlive its measurement. */}
+      {gate && gate.ok && props.blockers.length === 0 && (
+        <div className="sub" data-testid="comment-ok">
+          Passes both checks. Copy it, post it on LinkedIn yourself, then press I posted it.
+        </div>
+      )}
+
+      {/* ---- 8. copy, and the log ------------------------------------------- */}
+      <div className="btn-row">
+        <button className="btn small" disabled={!props.text.trim()} onClick={on.copy}
+          title="Copies the comment so you can paste it into LinkedIn yourself. It posts nothing.">
+          Copy
+        </button>
+        <span style={{ flex: 1 }} />
+        <button className="btn small primary" disabled={props.blockers.length > 0} onClick={on.logPosted}
+          data-testid="comment-posted"
+          title={props.blockers.length > 0
+            ? `Not yet: ${props.blockers.join('; ')}`
+            : 'Records this comment as posted and stamps the time. It asks LinkedIn nothing — press it after '
+              + 'you posted the comment there yourself.'}>
+          {props.logging ? 'Logging…' : props.postedAt ? 'Logged as posted' : 'I posted it'}
+        </button>
+      </div>
+      {props.blockers.length > 0 && !props.postedAt && (
+        <div className="sub" data-testid="comment-blockers">Not loggable yet: {props.blockers[0]}</div>
+      )}
+      <div className="sub">
+        Nothing here watches LinkedIn. This button asks LinkedIn nothing and checks nothing — it records
+        what you tell it you did.
+      </div>
+      {props.status && <div className="sub" data-testid="comment-status">{props.status}</div>}
+    </div>
+  )
+}
+
+// --- the container ----------------------------------------------------------
+
+/**
+ * The stateful half: reads the post once on the button press, spends only on Draft it, re-checks
+ * free on every edit, and writes the `comments` row only when the human says they posted it.
+ */
+export function CommentPanel() {
+  const [post, setPost] = useState<CapturedPost | null>(null)
+  const [pastedPost, setPastedPost] = useState('')
+  const [take, setTake] = useState('')
+  const [text, setText] = useState('')
+  const [gate, setGate] = useState<CommentGate | null>(null)
+  const [checked, setChecked] = useState(false)
+  const [drafted, setDrafted] = useState(false)
+  const [edited, setEdited] = useState(false)
+
+  const [reading, setReading] = useState(false)
+  const [drafting, setDrafting] = useState(false)
+  const [checking, setChecking] = useState(false)
+  const [logging, setLogging] = useState(false)
+  const [postedAt, setPostedAt] = useState<string | null>(null)
+  const [status, setStatus] = useState<string | null>(null)
+
+  // Last answer wins: a slow check on an old keystroke must never overwrite a newer one.
+  const checkSeq = useRef(0)
+  // The post exactly as lib/comments.ts read it. The panel renders a reduced view of it, but the
+  // writer needs the whole thing — the canonical URL is the row's only key.
+  const readPostRef = useRef<LinkedInPost | null>(null)
+  // What the model wrote, kept unchanged across hand edits so the row can hold both `draft` and the
+  // `final_text` he actually posted — the contract has a column for each, and collapsing them would
+  // lose the only record of what the model contributed.
+  const draftedTextRef = useRef<string | null>(null)
+  // The exact (comment, take, post) the hub has already answered on. A paid draft comes back
+  // pre-checked, so the free re-check must not fire a redundant round trip for the same three.
+  const lastCheckedRef = useRef<string | null>(null)
+  // The take is restored from storage on open; the first pass of the save effect must not write the
+  // empty box back over it.
+  const takeRestored = useRef(false)
+
+  const postText = useMemo(() => postTextState(post, pastedPost), [post, pastedPost])
+
+  // The popup closes the moment he clicks the page behind it — and reading the post means clicking
+  // that page. So the take is restored on open and kept on every pause: losing it each time would
+  // make the panel unusable. Local storage only; this sends nothing anywhere.
+  useEffect(() => {
+    let alive = true
+    void (async () => {
+      try {
+        const settings = await getCommentSettings()
+        if (alive && settings.lastTake) setTake((current) => current || settings.lastTake)
+      } catch {
+        /* an unreadable store yields an empty box he can type into, never a broken panel */
+      }
+    })()
+    return () => { alive = false }
+  }, [])
+
+  useEffect(() => {
+    if (!takeRestored.current) {
+      takeRestored.current = true
+      return
+    }
+    const timer = setTimeout(() => { void rememberTake(take) }, 600)
+    return () => clearTimeout(timer)
+  }, [take])
+
+  // The free gate. It runs on every edit of the comment, the view or the post text, because all
+  // three change the answer: coverage is measured against the take, and register against the post.
+  useEffect(() => {
+    if (!text.trim()) {
+      setGate(null)
+      setChecked(false)
+      setChecking(false)
+      lastCheckedRef.current = null
+      return
+    }
+    const signature = `${text} ${take} ${postText.text}`
+    if (signature === lastCheckedRef.current) return
+    // Any verdict on screen belongs to the PREVIOUS text, so it stops counting the instant this one
+    // differs — not 250 ms later when the debounce fires. A window in which a stale "passes" could be
+    // pressed is exactly the silent fallback this project refuses.
+    setChecked(false)
+    const seq = ++checkSeq.current
+    const timer = setTimeout(() => {
+      setChecking(true)
+      checkComment({ text, take, postText: postText.text })
+        .then((raw) => {
+          if (seq !== checkSeq.current) return
+          const answered = readEnvelope(raw)
+          if (!answered.payload) {
+            setChecked(false)
+            setGate(null)
+            setStatus(`This comment was not checked — ${answered.note || 'the hub answered with no verdict'}. `
+              + 'Until it is, I posted it stays off.')
+            return
+          }
+          setGate(readGate(raw, text))
+          setChecked(true)
+          lastCheckedRef.current = signature
+        })
+        .catch((e) => {
+          if (seq !== checkSeq.current) return
+          setChecked(false)
+          setGate(null)
+          setStatus(`This comment was not checked — ${errorText(e)}. The hub does the checking; start it with `
+            + '"make serve". Until it answers, I posted it stays off.')
+        })
+        .finally(() => { if (seq === checkSeq.current) setChecking(false) })
+    }, 250)
+    return () => clearTimeout(timer)
+  }, [text, take, postText.text])
+
+  const read = async () => {
+    setReading(true)
+    setStatus(null)
+    try {
+      const raw = await captureActiveTabPost()
+      const captured = readPostCapture(raw)
+      // The reader's own verdict decides, not whether some fields came back: a refused capture may
+      // still carry the address it wanted, and treating that as a post would file the comment
+      // against the wrong page.
+      if (!captured.post) {
+        setStatus(captured.note
+          || 'That tab is not a LinkedIn post, or the page gave nothing back. Nothing was read, and nothing was changed.')
+        return
+      }
+      // A new post clears everything about the old one — but NOT the view he typed. His words are
+      // his, and a re-read must not throw them away.
+      readPostRef.current = raw?.post ?? null
+      setPost(captured.post)
+      setPastedPost('')
+      setText('')
+      setGate(null)
+      setChecked(false)
+      setDrafted(false)
+      setEdited(false)
+      setPostedAt(null)
+      draftedTextRef.current = null
+      lastCheckedRef.current = null
+      const state = postTextState(captured.post, '')
+      setStatus(`${captured.note || 'Read the post.'} ${state.thin ? state.why : `${captured.post.words} words read.`}`)
+    } catch (e) {
+      setStatus(`Nothing was read — ${errorText(e)}. Nothing on the page was touched.`)
+    } finally {
+      setReading(false)
+    }
+  }
+
+  const runDraft = async () => {
+    const ok = confirm(
+      'Draft this comment with one model call?\n\n'
+      + 'This is the only thing on this screen that spends money — a fraction of a cent, once, now. It writes '
+      + 'YOUR view as a comment on this post and mirrors the post\'s register, then comes back with the two '
+      + 'measurements it was judged on.\n\n'
+      + (postText.text.trim()
+        ? ''
+        : 'There is no post text, so there is no register to mirror — it will be written from your view alone.\n\n')
+      + 'Nothing is posted to LinkedIn: you read the result, copy it, and post it yourself.',
+    )
+    if (!ok) return
+    setDrafting(true)
+    setStatus(null)
+    try {
+      const raw = await draftComment({ postText: postText.text, take, author: post?.author ?? null })
+      const answered = readEnvelope(raw)
+      if (!answered.payload) {
+        setStatus(`Nothing was drafted — ${answered.note || 'the hub answered without a comment'}. `
+          + 'Everything you typed is exactly as you left it.')
+        return
+      }
+      const result = readGate(raw)
+      draftedTextRef.current = result.text
+      setText(result.text)
+      setGate(result)
+      setChecked(true)
+      setDrafted(true)
+      setEdited(false)
+      // The paid answer already carries its own verdict, so the free re-check has nothing to add for
+      // this exact trio and does not fire.
+      lastCheckedRef.current = `${result.text} ${take} ${postText.text}`
+      setStatus(`Drafted, ${result.chars} characters${result.costUsd != null ? ` · $${result.costUsd.toFixed(4)} spent` : ''}`
+        + `${result.reasons.length > 0 ? ' — and it did not pass its own checks; the reasons are below.' : '. Read it before you post it.'}`)
+    } catch (e) {
+      setStatus(`Not drafted — ${errorText(e)}. Everything you typed is exactly as you left it.`)
+    } finally {
+      setDrafting(false)
+    }
+  }
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setStatus('Copied. Paste it into LinkedIn and post it yourself — nothing here does that for you.')
+    } catch (e) {
+      setStatus(`Not copied — ${errorText(e)}. Select the text in the box and copy it by hand.`)
+    }
+  }
+
+  const busy = reading || drafting || logging || checking
+  const blockers = postedBlockers({
+    text,
+    checked,
+    reasons: gate?.reasons ?? [],
+    postUrl: post?.postUrl ?? '',
+    busy,
+    postedAt,
+  })
+
+  const logPosted = async () => {
+    const stored = readPostRef.current
+    if (blockers.length > 0 || !stored) return
+    const ok = confirm(
+      'Log this comment as posted?\n\n'
+      + 'Pressing OK records it in your comment log, marks it posted and stamps the time.\n\n'
+      + 'It asks LinkedIn nothing. Nothing here reads, opens, clicks, watches or posts anything on LinkedIn, '
+      + 'and nothing checks whether the comment is really there — this records what you tell it you did. '
+      + 'Press it only after you posted the comment on LinkedIn yourself.',
+    )
+    if (!ok) return
+    setLogging(true)
+    setStatus(null)
+    try {
+      // saveComment, not markPosted: markPosted is this same call carrying only the final text, and
+      // one press is the only write this panel makes — his take and the model's draft would then be
+      // missing from the row. The post text sent is the one the comment was actually measured
+      // against, so a pasted post is what the log remembers rather than the page's thin read.
+      const written = readOutcome(await saveComment(
+        { ...stored, text: postText.text || stored.text },
+        {
+          take: take.trim(),
+          // Undefined, not '': the lib leaves a field it is not given alone, and an empty string
+          // would overwrite the model's draft in the row with nothing on a comment he typed himself.
+          draft: draftedTextRef.current ?? undefined,
+          finalText: text,
+          posted: true,
+          postedAt: new Date(),
+        },
+      ))
+      // What actually happened, not what was attempted: only a write that landed latches the button.
+      if (written.status === 'sent') {
+        setPostedAt(new Date().toISOString())
+        setStatus(`${written.note || 'Logged as posted.'} Nothing else happens — nothing is sent anywhere.`)
+      } else if (written.status === 'queued') {
+        setPostedAt(new Date().toISOString())
+        setStatus(`${written.note} It reaches the log when the hub receives it, not before.`)
+      } else {
+        setStatus(`${written.note || 'The hub did not take it.'} Nothing is logged for this comment yet — `
+          + 'press it again once that is fixed.')
+      }
+    } catch (e) {
+      setStatus(`Not logged — ${errorText(e)}. Nothing was written; press it again when the hub is up.`)
+    } finally {
+      setLogging(false)
+    }
+  }
+
+  return (
+    <CommentForm
+      post={post}
+      postText={postText}
+      pastedPost={pastedPost}
+      take={take}
+      text={text}
+      gate={gate}
+      mirror={mirrorLine(gate?.postRegister ?? null, gate?.commentRegister ?? null)}
+      coverage={coverageLine(gate?.coverage ?? null)}
+      draft={draftState({ take, postText: postText.text, busy })}
+      blockers={blockers}
+      reading={reading}
+      drafting={drafting}
+      checking={checking}
+      logging={logging}
+      drafted={drafted}
+      edited={edited}
+      postedAt={postedAt}
+      status={status}
+      on={{
+        read: () => { void read() },
+        setPastedPost,
+        setTake,
+        draft: () => { void runDraft() },
+        // Once he takes the pen the comment stays his: it is re-checked, never re-written.
+        setText: (value) => { setEdited(value !== draftedTextRef.current); setText(value) },
+        copy: () => { void copy() },
+        logPosted: () => { void logPosted() },
+      }}
+    />
+  )
+}

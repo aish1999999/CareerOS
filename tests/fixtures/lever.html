@@ -1,0 +1,39 @@
+<!-- Trimmed Lever-style application form snapshot -->
+<div class="content">
+  <div class="posting-headline"><h2>Backend Engineer</h2></div>
+  <form id="application-form">
+    <ul>
+      <li class="application-question">
+        <label>Full name<span class="required">✱</span></label>
+        <input type="text" name="name" required>
+      </li>
+      <li class="application-question">
+        <label>Email<span class="required">✱</span></label>
+        <input type="email" name="email" required>
+      </li>
+      <li class="application-question">
+        <label>Current company</label>
+        <input type="text" name="org">
+      </li>
+      <li class="application-question">
+        <label>GitHub URL</label>
+        <input type="text" name="urls[GitHub]">
+      </li>
+      <li class="application-question">
+        <label>What is your expected salary?</label>
+        <input type="text" name="cards[custom_q][field0]">
+      </li>
+      <li class="application-question">
+        <fieldset>
+          <legend>Do you now or in the future require visa sponsorship?</legend>
+          <label><input type="radio" name="sponsorship" value="Yes">Yes</label>
+          <label><input type="radio" name="sponsorship" value="No">No</label>
+        </fieldset>
+      </li>
+      <li class="application-question">
+        <label><input type="checkbox" name="consent[marketing]">I agree to the privacy policy and terms of service</label>
+      </li>
+    </ul>
+    <button type="submit">Submit application</button>
+  </form>
+</div>

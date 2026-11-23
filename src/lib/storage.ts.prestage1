@@ -1,0 +1,365 @@
+import type { OptionSet, Profile, QAEntry, Settings, StoreData } from '@/types'
+import { DEFAULT_ENABLED_DOMAINS, SCHEMA_VERSION, StoreSchema, defaultStore } from '@/lib/schema'
+import { normalizeEntryDates } from '@/lib/dates'
+
+// ---------------------------------------------------------------------------
+// Typed wrapper over chrome.storage.local (Section 9). Works from any
+// extension context (background, content script, popup, options).
+// The whole store lives under one key so migrations see it atomically.
+// ---------------------------------------------------------------------------
+
+const STORE_KEY = 'flashfiller'
+
+type Migration = (raw: Record<string, unknown>) => Record<string, unknown>
+
+/**
+ * v1 → v2: v1 kept qa entries without status/source/personas and had no
+ * suppressedSeedIds. Everything gains safe defaults; captured provenance is
+ * unknowable retroactively so v1 entries become status "active", source "import".
+ */
+const migrations: Record<number, Migration> = {
+  1: (raw) => {
+    const qa = Array.isArray(raw.qa) ? (raw.qa as Record<string, unknown>[]) : []
+    return {
+      ...raw,
+      schemaVersion: 2,
+      qa: qa.map((e) => ({
+        status: 'active',
+        source: 'import',
+        personas: [],
+        aliases: [],
+        tags: [],
+        variables: [],
+        ...e,
+      })),
+    }
+  },
+  /** v2 → v3: qa entries gain captured `options`; the store gains user-defined
+   *  `optionSets` (Options tab). Options weren't recorded before, so old
+   *  entries start empty. */
+  2: (raw) => {
+    const qa = Array.isArray(raw.qa) ? (raw.qa as Record<string, unknown>[]) : []
+    return {
+      ...raw,
+      schemaVersion: 3,
+      qa: qa.map((e) => ({ options: [], ...e })),
+      optionSets: Array.isArray(raw.optionSets) ? raw.optionSets : [],
+    }
+  },
+  /** v3 → v4: the extension now runs on every site (dormant unless enabled),
+   *  and the supported-ATS list grew (Ashby/iCIMS/SmartRecruiters were never
+   *  in the old default, SuccessFactors is new). Union rather than replace —
+   *  single-user extension, re-adding a removed default is the lesser evil
+   *  vs. silently losing user-added domains. */
+  3: (raw) => {
+    const settings = (raw.settings ?? {}) as Record<string, unknown>
+    const existing = Array.isArray(settings.enabledDomains)
+      ? (settings.enabledDomains as string[])
+      : []
+    return {
+      ...raw,
+      schemaVersion: 4,
+      settings: {
+        ...settings,
+        enabledDomains: [...new Set([...existing, ...DEFAULT_ENABLED_DOMAINS])],
+      },
+    }
+  },
+  /** v4 → v5: work-history/education dates become canonical "YYYY-MM".
+   *  Free-text values ("January 2026", "Present") mis-fill segmented ATS
+   *  date widgets; "Present"-style text becomes '' (= current). */
+  4: (raw) => {
+    const profile = (raw.profile ?? {}) as Record<string, unknown>
+    const fixDates = (entries: unknown) =>
+      Array.isArray(entries)
+        ? normalizeEntryDates(
+          entries.map((e) => ({
+            startDate: '',
+            endDate: '',
+            ...(e as Record<string, unknown>),
+          })) as { startDate: string; endDate: string }[],
+        )
+        : entries
+    return {
+      ...raw,
+      schemaVersion: 5,
+      profile: {
+        ...profile,
+        workHistory: fixDates(profile.workHistory),
+        education: fixDates(profile.education),
+      },
+    }
+  },
+  /** v5 → v6: the learned-answer rebuild (2026-07-16, superseding the
+   *  2026-07-14 no-gate decision — user-confirmed).
+   *  1. captureLoopEnabled is force-enabled once: the capture loop is the
+   *     feature being rebuilt; shipping it dead-by-stale-setting would read
+   *     as "still broken". The Settings toggle keeps working afterward.
+   *  2. Legacy LEARNED entries (source captured/inferred) that are active go
+   *     back through the review gate once — they are exactly the entries the
+   *     confirmed wrong-value fills came from. Curated training/import
+   *     entries are untouched. "Approve all" in the Review tab is one click. */
+  5: (raw) => {
+    const settings = (raw.settings ?? {}) as Record<string, unknown>
+    const qa = Array.isArray(raw.qa) ? (raw.qa as Record<string, unknown>[]) : []
+    return {
+      ...raw,
+      schemaVersion: 6,
+      settings: { ...settings, captureLoopEnabled: true },
+      qa: qa.map((e) =>
+        (e.source === 'captured' || e.source === 'inferred') && e.status === 'active'
+          ? {
+            ...e,
+            status: 'needs_review',
+            reviewNote: 'Saved before the review gate existed — approve or discard',
+          }
+          : e,
+      ),
+    }
+  },
+  /** v6 → v7: poisoned-capture cleanup (2026-07-16 live corruption).
+   *  SPA node recycling misattributed captured values across widgets, so
+   *  stores accumulated: EEO answers wearing non-EEO aliases ("School or
+   *  University*" on a disability entry — it out-scored the real school
+   *  answer at 1.0), opaque Workday option ids as answers, placeholder
+   *  text as aliases, and brand-stripped sentence fragments. Rules are
+   *  INLINED, not imported — a migration is a frozen snapshot of the rules
+   *  at write time, not a consumer of live constants.
+   *  1. Learned entries whose answer is an opaque hex/uuid id → dropped.
+   *  2. Aliases crossing the EEO/non-EEO line vs their entry's question →
+   *     stripped (no legitimate wording crosses that line).
+   *  3. Placeholder-text aliases ("Yes Required", "Select One…") → stripped.
+   *  4. Learned answers ending in a dangling connective ("I have never
+   *     worked for ") are brand-strip fragments → re-gated for review. */
+  6: (raw) => {
+    const EEO =
+      /\b(gender|race|ethnicit\w*|veteran|disabilit\w*|sexual orientation|transgender|lgbtq?\+?|demographic|hispanic|latino|latinx)\b/i
+    const OPAQUE_ID =
+      /^(?:[0-9a-f]{24,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i
+    const PLACEHOLDER_ALIAS = /^(please\s+)?(select|choose|pick)\b|^(yes|no|\d+\s*%)\s+required$/i
+    const DANGLING_END = /\b(for|with|at|to|about|in|of)\s+$/i
+    const qa = Array.isArray(raw.qa) ? (raw.qa as Record<string, unknown>[]) : []
+    const cleaned = qa
+      .filter((e) => {
+        const learned = e.source === 'captured' || e.source === 'inferred'
+        return !(learned && OPAQUE_ID.test(String(e.answer ?? '').trim()))
+      })
+      .map((e) => {
+        const question = String(e.question ?? '')
+        const aliases = Array.isArray(e.aliases) ? (e.aliases as string[]) : []
+        const kept = aliases.filter(
+          (a) => EEO.test(a) === EEO.test(question) && !PLACEHOLDER_ALIAS.test(a.trim()),
+        )
+        const next = kept.length === aliases.length ? e : { ...e, aliases: kept }
+        const learned = next.source === 'captured' || next.source === 'inferred'
+        if (learned && next.status === 'active' && DANGLING_END.test(String(next.answer ?? ''))) {
+          return {
+            ...next,
+            status: 'needs_review',
+            reviewNote: 'Answer looks like a truncated fragment — check before it fills again',
+          }
+        }
+        return next
+      })
+    return { ...raw, schemaVersion: 7, qa: cleaned }
+  },
+  /** v7 → v8: Oracle Recruiting Cloud (oraclecloud.com) joins the default
+   *  ATS list (first live target: Cummins on fa-espx-saasfaprod1). The
+   *  enabledDomains union only ever ran in v3→v4, so an existing store never
+   *  sees a NEW default without a migration. Same union-not-replace rationale
+   *  as v3. Inlined, not DEFAULT_ENABLED_DOMAINS — a migration is a frozen
+   *  snapshot; importing the live list would re-add domains the user removes
+   *  from future defaults. */
+  7: (raw) => {
+    const settings = (raw.settings ?? {}) as Record<string, unknown>
+    // No enabledDomains key at all → leave it absent; the zod default
+    // (DEFAULT_ENABLED_DOMAINS, which now includes Oracle) fills it whole.
+    if (!Array.isArray(settings.enabledDomains)) return { ...raw, schemaVersion: 8 }
+    const existing = settings.enabledDomains as string[]
+    return {
+      ...raw,
+      schemaVersion: 8,
+      settings: {
+        ...settings,
+        enabledDomains: [...new Set([...existing, 'oraclecloud.com'])],
+      },
+    }
+  },
+}
+
+function runMigrations(raw: Record<string, unknown>): Record<string, unknown> {
+  let data = raw
+  let version = typeof data.schemaVersion === 'number' ? data.schemaVersion : SCHEMA_VERSION
+  while (version < SCHEMA_VERSION) {
+    const migrate = migrations[version]
+    if (!migrate) break
+    data = migrate(data)
+    version = typeof data.schemaVersion === 'number' ? data.schemaVersion : version + 1
+  }
+  return data
+}
+
+export async function getStore(): Promise<StoreData> {
+  const result = await chrome.storage.local.get(STORE_KEY)
+  const raw = result[STORE_KEY]
+  if (raw === undefined || raw === null) return defaultStore()
+  const migrated = runMigrations(raw as Record<string, unknown>)
+  const parsed = StoreSchema.safeParse(migrated)
+  if (!parsed.success) {
+    // Never destroy user data on a parse failure — keep what zod could not
+    // read under a recovery key and start from defaults.
+    console.error('[FlashFiller] store failed validation; preserving raw copy', parsed.error)
+    await chrome.storage.local.set({ [`${STORE_KEY}_recovery`]: raw })
+    return defaultStore()
+  }
+  return parsed.data as StoreData
+}
+
+export async function setStore(store: StoreData): Promise<void> {
+  await chrome.storage.local.set({ [STORE_KEY]: store })
+}
+
+async function update(mutate: (store: StoreData) => void): Promise<StoreData> {
+  const store = await getStore()
+  mutate(store)
+  await setStore(store)
+  return store
+}
+
+/** Dates live as "YYYY-MM" in the store, whatever a UI draft or import held. */
+function withNormalizedDates(profile: Profile): Profile {
+  return {
+    ...profile,
+    workHistory: normalizeEntryDates(profile.workHistory),
+    education: normalizeEntryDates(profile.education),
+  }
+}
+
+export async function updateProfile(profile: Profile): Promise<void> {
+  await update((s) => {
+    s.profile = withNormalizedDates(profile)
+  })
+}
+
+export async function updateSettings(patch: Partial<Settings>): Promise<Settings> {
+  const store = await update((s) => {
+    s.settings = { ...s.settings, ...patch }
+  })
+  return store.settings
+}
+
+/** Read-modify-write patch of one entry by id — closes the stale-object race
+ *  between persistLearning's mergeAsAlias upsert and the approval/demotion
+ *  writes (both can fire around one accepted fill). No-op if the id is gone. */
+export async function patchQA(id: string, patch: Partial<QAEntry>): Promise<void> {
+  await update((s) => {
+    const i = s.qa.findIndex((e) => e.id === id)
+    if (i >= 0) s.qa[i] = { ...s.qa[i], ...patch }
+  })
+}
+
+export async function upsertQA(entry: QAEntry): Promise<void> {
+  await update((s) => {
+    const i = s.qa.findIndex((e) => e.id === entry.id)
+    if (i >= 0) s.qa[i] = entry
+    else s.qa.push(entry)
+  })
+}
+
+export async function upsertManyQA(entries: QAEntry[]): Promise<void> {
+  await update((s) => {
+    for (const entry of entries) {
+      const i = s.qa.findIndex((e) => e.id === entry.id)
+      if (i >= 0) s.qa[i] = entry
+      else s.qa.push(entry)
+    }
+  })
+}
+
+export async function deleteQA(id: string): Promise<void> {
+  await update((s) => {
+    s.qa = s.qa.filter((e) => e.id !== id)
+  })
+}
+
+export async function upsertOptionSet(set: OptionSet): Promise<void> {
+  await update((s) => {
+    const i = s.optionSets.findIndex((o) => o.id === set.id)
+    if (i >= 0) s.optionSets[i] = set
+    else s.optionSets.push(set)
+  })
+}
+
+export async function deleteOptionSet(id: string): Promise<void> {
+  await update((s) => {
+    s.optionSets = s.optionSets.filter((o) => o.id !== id)
+  })
+}
+
+export async function exportData(): Promise<StoreData> {
+  return getStore()
+}
+
+/**
+ * Import a validated payload (Section 9). merge: qa entries with a matching
+ * id are replaced, others appended; profile/settings are overwritten only if
+ * present in the payload. replace: payload sections fully replace current.
+ */
+export async function importData(
+  data: Partial<StoreData>,
+  mode: 'merge' | 'replace',
+): Promise<void> {
+  await update((s) => {
+    if (data.profile) s.profile = withNormalizedDates(data.profile)
+    if (data.settings) s.settings = { ...s.settings, ...data.settings }
+    if (data.qa) {
+      if (mode === 'replace') {
+        s.qa = data.qa
+      } else {
+        for (const entry of data.qa) {
+          const i = s.qa.findIndex((e) => e.id === entry.id)
+          if (i >= 0) s.qa[i] = entry
+          else s.qa.push(entry)
+        }
+      }
+    }
+    if (data.optionSets) {
+      if (mode === 'replace') {
+        s.optionSets = data.optionSets
+      } else {
+        for (const set of data.optionSets) {
+          const i = s.optionSets.findIndex((o) => o.id === set.id)
+          if (i >= 0) s.optionSets[i] = set
+          else s.optionSets.push(set)
+        }
+      }
+    }
+  })
+}
+
+/** One-click "delete all my data" (Section 13). */
+export async function clearAll(): Promise<void> {
+  await chrome.storage.local.remove([STORE_KEY, `${STORE_KEY}_recovery`])
+}
+
+/** Subscribe to store changes from any context. Returns an unsubscribe fn. */
+export function onStoreChanged(callback: (store: StoreData) => void): () => void {
+  const listener = (
+    changes: { [key: string]: chrome.storage.StorageChange },
+    area: string,
+  ) => {
+    if (area !== 'local' || !(STORE_KEY in changes)) return
+    const parsed = StoreSchema.safeParse(changes[STORE_KEY].newValue ?? {})
+    if (parsed.success) callback(parsed.data as StoreData)
+  }
+  chrome.storage.onChanged.addListener(listener)
+  return () => chrome.storage.onChanged.removeListener(listener)
+}
+
+export function newId(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `id-${Date.now()}-${Math.floor(Math.random() * 1e9)}`
+}
+
+export function pendingReviewCount(store: StoreData): number {
+  return store.qa.filter((e) => e.status === 'needs_review').length
+}

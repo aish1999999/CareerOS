@@ -1,0 +1,20 @@
+import { createRoot } from 'react-dom/client'
+import { AppProvider } from '@/ui/store'
+import { OutreachPanel } from '@/ui/components/OutreachPanel'
+import '@/ui/styles.css'
+
+// The side panel is the outreach panel and nothing else (Stage 8, Bob's call: both surfaces, one
+// component). The popup keeps every tab; this window exists because it stays open beside the
+// LinkedIn profile you are reading, which a popup cannot do — it closes the moment you click the
+// page, and reading a profile means clicking the page.
+//
+// Same component, same store, same styles. Nothing here runs on LinkedIn: the panel reads a profile
+// only when you press its button, and it never sends anything.
+
+createRoot(document.getElementById('root')!).render(
+  <AppProvider>
+    <div className="app">
+      <OutreachPanel />
+    </div>
+  </AppProvider>,
+)

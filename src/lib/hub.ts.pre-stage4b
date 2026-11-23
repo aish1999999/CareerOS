@@ -1,0 +1,250 @@
+import type {
+  EnrichResult,
+  HubBatchOp,
+  HubBatchRequest,
+  HubBatchResponse,
+  HubBatchResult,
+  HubHealth,
+  HubSurface,
+} from '@contract/types'
+import type { EntityTable } from '@contract/entities'
+import { getTailorConfig } from '@/lib/tailor'
+import { assertAllowedTailorUrl } from '@/lib/tailor-url'
+
+// ---------------------------------------------------------------------------
+// Hub client (Stage 3) — the extension's ONE way to log anything to the database.
+//
+// Every write goes through an outbox in chrome.storage.local first, then the
+// outbox is flushed to POST /db/batch on the Tailor service (same base URL,
+// same token as the Tailor tab). If the service is down the ops simply wait;
+// the next enqueue, the next popup open, or an explicit flushHubOutbox() call
+// sends them. Nothing here throws to a caller for a transport problem and
+// nothing runs on a timer — the same house discipline as tailor.ts.
+//
+// Per-op outcomes: a 5xx/502 (database unreachable behind the hub) keeps the op
+// queued; a 4xx (the hub refused the row: validation, unknown table, 404 on
+// update) is a bug or a stale reference, not a transient — the op moves to the
+// dead-letter list so it can never block the queue, and it stays visible there.
+//
+// The extension never holds a Supabase key; the hub does. Rows are snake_case
+// entity rows (packages/contract/entities.ts); the envelope is camelCase.
+// ---------------------------------------------------------------------------
+
+export const HUB_OUTBOX_KEY = 'flashfiller_hub_outbox_v1'
+export const HUB_DEAD_KEY = 'flashfiller_hub_dead_v1'
+export const HUB_SURFACE: HubSurface = 'extension'
+export const HUB_BATCH_MAX = 50
+export const HUB_DEAD_MAX = 200
+
+export interface OutboxEntry {
+  /** Stable per op; sent as clientRef, matched on the result. */
+  ref: string
+  op: HubBatchOp
+  queuedAt: number
+  attempts: number
+  lastError?: string | null
+}
+
+export interface DeadEntry extends OutboxEntry {
+  status: number
+  diedAt: number
+}
+
+export interface FlushReport {
+  /** Ops the hub accepted. */
+  sent: number
+  /** Ops still waiting (service down, or the database unreachable behind it). */
+  left: number
+  /** Ops the hub refused (4xx) — moved to the dead-letter list. */
+  dead: number
+  /** True when the service could not be reached at all. */
+  offline: boolean
+  /** Human-readable reason when nothing moved. */
+  reason?: string | null
+}
+
+function newRef(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `op-${Date.now()}-${Math.floor(Math.random() * 1e9)}`
+}
+
+async function readList<T>(key: string): Promise<T[]> {
+  const raw = await chrome.storage.local.get(key)
+  const list = raw?.[key]
+  return Array.isArray(list) ? (list as T[]) : []
+}
+
+async function writeList<T>(key: string, list: T[]): Promise<void> {
+  await chrome.storage.local.set({ [key]: list })
+}
+
+export async function getHubOutbox(): Promise<OutboxEntry[]> {
+  return readList<OutboxEntry>(HUB_OUTBOX_KEY)
+}
+
+export async function getHubDeadLetters(): Promise<DeadEntry[]> {
+  return readList<DeadEntry>(HUB_DEAD_KEY)
+}
+
+export async function clearHubDeadLetters(): Promise<void> {
+  await chrome.storage.local.remove(HUB_DEAD_KEY)
+}
+
+/**
+ * Queue one op and try to send everything queued. Never throws for transport
+ * problems; the returned ref identifies the op in the outbox / dead letters.
+ */
+export async function hubEnqueue(op: HubBatchOp, opts: { flush?: boolean } = {}): Promise<string> {
+  const ref = op.clientRef ?? newRef()
+  const entry: OutboxEntry = { ref, op: { ...op, clientRef: ref }, queuedAt: Date.now(), attempts: 0, lastError: null }
+  const outbox = await getHubOutbox()
+  outbox.push(entry)
+  await writeList(HUB_OUTBOX_KEY, outbox)
+  if (opts.flush !== false) await flushHubOutbox()
+  return ref
+}
+
+export function hubInsert(table: EntityTable, row: Record<string, unknown>, opts?: { flush?: boolean }): Promise<string> {
+  return hubEnqueue({ op: 'insert', table, body: row }, opts)
+}
+
+export function hubUpsert(
+  table: EntityTable,
+  row: Record<string, unknown>,
+  onConflict?: string,
+  opts?: { flush?: boolean },
+): Promise<string> {
+  return hubEnqueue({ op: 'upsert', table, body: row, onConflict: onConflict ?? null }, opts)
+}
+
+export function hubUpdate(table: EntityTable, id: string, patch: Record<string, unknown>, opts?: { flush?: boolean }): Promise<string> {
+  return hubEnqueue({ op: 'update', table, id, body: patch }, opts)
+}
+
+/** An explicit history row; the hub also mirrors every write on its own. */
+export function hubEvent(entity: string, entityId: string | null, action: string, payload: Record<string, unknown> = {}): Promise<string> {
+  return hubEnqueue({ op: 'insert', table: 'events', body: { surface: HUB_SURFACE, entity, entity_id: entityId, action, payload } })
+}
+
+// -- transport ---------------------------------------------------------------
+
+async function hubFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const { baseUrl, token } = await getTailorConfig()
+  assertAllowedTailorUrl(baseUrl)
+  return fetch(`${baseUrl}${path}`, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Surface': HUB_SURFACE,
+      ...(token ? { 'X-Tailor-Token': token } : {}),
+      ...(init.headers ?? {}),
+    },
+  })
+}
+
+let flushing: Promise<FlushReport> | null = null
+
+/**
+ * Send the outbox to POST /db/batch, oldest first, at most HUB_BATCH_MAX per
+ * request. Single-flight: concurrent callers share one flush.
+ */
+export function flushHubOutbox(): Promise<FlushReport> {
+  if (flushing) return flushing
+  flushing = doFlush().finally(() => {
+    flushing = null
+  })
+  return flushing
+}
+
+async function doFlush(): Promise<FlushReport> {
+  let outbox = await getHubOutbox()
+  if (outbox.length === 0) return { sent: 0, left: 0, dead: 0, offline: false, reason: 'outbox empty' }
+  let sent = 0
+  let dead = 0
+
+  while (outbox.length > 0) {
+    const chunk = outbox.slice(0, HUB_BATCH_MAX)
+    const body: HubBatchRequest = { ops: chunk.map((e) => e.op), surface: HUB_SURFACE }
+
+    let response: Response
+    try {
+      response = await hubFetch('/db/batch', { method: 'POST', body: JSON.stringify(body) })
+      if (!response) throw new Error('no response')
+    } catch {
+      return { sent, left: outbox.length, dead, offline: true, reason: 'Tailor service is not running.' }
+    }
+    if (response.status === 401) {
+      return { sent, left: outbox.length, dead, offline: false, reason: 'Tailor rejected the token — set it in the Tailor tab.' }
+    }
+    if (response.status === 503) {
+      return { sent, left: outbox.length, dead, offline: false, reason: 'The hub has no database configured (apps/mapper/.env).' }
+    }
+
+    let payload: HubBatchResponse | null = null
+    try {
+      payload = (await response.json()) as HubBatchResponse
+    } catch {
+      payload = null
+    }
+    if (!payload || !Array.isArray(payload.results)) {
+      // 5xx or a non-JSON answer: leave everything queued, count an attempt.
+      for (const e of chunk) e.attempts += 1
+      await writeList(HUB_OUTBOX_KEY, outbox)
+      return { sent, left: outbox.length, dead, offline: false, reason: `Hub answered HTTP ${response.status}.` }
+    }
+
+    const byRef = new Map<string, HubBatchResult>()
+    for (const r of payload.results) if (r.clientRef) byRef.set(r.clientRef, r)
+
+    const keep: OutboxEntry[] = []
+    const deadNow: DeadEntry[] = []
+    for (const e of chunk) {
+      const r = byRef.get(e.ref)
+      if (r?.ok) {
+        sent += 1
+      } else if (r && r.status >= 400 && r.status < 500) {
+        deadNow.push({ ...e, attempts: e.attempts + 1, lastError: r.error ?? `HTTP ${r.status}`, status: r.status, diedAt: Date.now() })
+      } else {
+        keep.push({ ...e, attempts: e.attempts + 1, lastError: r?.error ?? 'no result for this op' })
+      }
+    }
+    if (deadNow.length) {
+      dead += deadNow.length
+      const existing = await getHubDeadLetters()
+      await writeList(HUB_DEAD_KEY, [...existing, ...deadNow].slice(-HUB_DEAD_MAX))
+    }
+    outbox = [...keep, ...outbox.slice(chunk.length)]
+    await writeList(HUB_OUTBOX_KEY, outbox)
+    if (keep.length > 0) {
+      // Something in this chunk is stuck on the database (5xx behind the hub); stop
+      // here rather than hammer — the next flush retries.
+      return { sent, left: outbox.length, dead, offline: false, reason: keep[0].lastError ?? null }
+    }
+  }
+  return { sent, left: 0, dead, offline: false, reason: null }
+}
+
+// -- reads (never queued) ---------------------------------------------------
+
+export async function hubHealth(): Promise<HubHealth | null> {
+  try {
+    const r = await hubFetch('/db/health')
+    if (!r.ok) return null
+    return (await r.json()) as HubHealth
+  } catch {
+    return null
+  }
+}
+
+export async function hubQuery<T = Record<string, unknown>>(table: EntityTable, params: Record<string, string> = {}): Promise<T[]> {
+  const qs = new URLSearchParams(params).toString()
+  const r = await hubFetch(`/db/${table}${qs ? `?${qs}` : ''}`)
+  if (!r.ok) throw new Error(`Hub returned HTTP ${r.status}.`)
+  const body = (await r.json()) as { rows: T[] }
+  return body.rows
+}
+
+export async function hubEnrichLead(leadId: string, force = false): Promise<EnrichResult> {
+  const r = await hubFetch(`/enrich/lead/${encodeURIComponent(leadId)}`, { method: 'POST', body: JSON.stringify({ force }) })
+  if (!r.ok) throw new Error(`Hub returned HTTP ${r.status}.`)
+  return (await r.json()) as EnrichResult
+}

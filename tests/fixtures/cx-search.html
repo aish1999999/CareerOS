@@ -1,0 +1,68 @@
+<!doctype html>
+<!-- Searchable-combobox fixture (harness verification for the 2026-07-17
+     type-to-filter fallback + degree variants). Mimics catalogs that open on
+     a rendered SUBSET (or nothing) and only reveal the full list through the
+     input's filter — the NOV Oracle City/Degree failure shape, expressed in
+     generic role=listbox markup so it runs on localhost without the Oracle
+     adapter. -->
+<html lang="en">
+<head><meta charset="utf-8" /><title>Searchable combobox fixture</title></head>
+<body>
+  <h1>Candidate address</h1>
+  <div>
+    <label for="city">City</label>
+    <input id="city" name="city" type="text" role="combobox" aria-haspopup="listbox"
+           aria-expanded="false" autocomplete="off" />
+  </div>
+  <div>
+    <label for="degree">Degree</label>
+    <input id="degree" name="degree" type="text" role="combobox" aria-haspopup="listbox"
+           aria-expanded="false" autocomplete="off" />
+  </div>
+  <div>
+    <label for="zip">Zip/Postal Code</label>
+    <input id="zip" name="postalCode" type="text" />
+  </div>
+
+  <script>
+    function searchable(inputId, catalog, initialSubset) {
+      const input = document.getElementById(inputId)
+      const portalId = inputId + '-portal'
+      const matches = () => {
+        const term = input.value.trim().toLowerCase()
+        return term === '' ? initialSubset : catalog.filter((c) => c.toLowerCase().includes(term))
+      }
+      const render = () => {
+        const portal = document.getElementById(portalId)
+        if (!portal) return
+        const names = matches()
+        portal.innerHTML = names.length === 0
+          ? '<div role="status">Start typing to search</div>'
+          : '<ul role="listbox">' + names.map((n) => '<li role="option">' + n + '</li>').join('') + '</ul>'
+        for (const li of portal.querySelectorAll('[role="option"]')) {
+          li.addEventListener('click', () => {
+            input.value = li.textContent
+            portal.remove()
+            input.setAttribute('aria-expanded', 'false')
+          })
+        }
+      }
+      input.addEventListener('click', () => {
+        if (document.getElementById(portalId)) return
+        const portal = document.createElement('div')
+        portal.id = portalId
+        document.body.appendChild(portal)
+        input.setAttribute('aria-expanded', 'true')
+        render()
+      })
+      input.addEventListener('input', render)
+    }
+    searchable('city',
+      ['Abilene', 'Amarillo', 'Austin', 'Dallas', 'El Paso', 'Fort Worth', 'Houston', 'Huntsville'],
+      ['Abilene', 'Amarillo', 'Austin'])
+    searchable('degree',
+      ['High School Diploma', "Associate's Degree", "Bachelor's Degree", "Master's Degree", 'Doctorate'],
+      ['High School Diploma', "Associate's Degree", "Bachelor's Degree", "Master's Degree", 'Doctorate'])
+  </script>
+</body>
+</html>

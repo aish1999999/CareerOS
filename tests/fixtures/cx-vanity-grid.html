@@ -1,0 +1,102 @@
+<!doctype html>
+<!-- Oracle CX behind a VANITY domain (careers.honeywell.com class, live
+     2026-07-21): the page is served from a branded hostname that no adapter
+     hosts-regex matches — the platform is only identifiable from the
+     server-rendered <base data-apibaseurl> marker (and the oj-hcm-ce bundle
+     URLs). The popups here use the REAL cx-select grid markup
+     (role=grid > row > gridcell, no option/listbox roles), so fills succeed
+     ONLY if the oracle adapter is resolved by page fingerprint: on localhost
+     the hostname path can never apply, exactly like careers.honeywell.com.
+     Pre-fix kill: "dropdown open: 0 scoped options" on every widget. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>cx-select vanity-domain grid fixture</title>
+  <base href="/" data-apibaseurl="https://ibqbjb.fa.ocs.oraclecloud.com:443"
+        data-vanitybaseurl="http://localhost:8791/" data-sitenumber="CX_1" />
+</head>
+<body>
+  <h1>Candidate address</h1>
+
+  <div class="input-row">
+    <label class="input-row__label cx-select__label" for="country-input">Country</label>
+    <div class="cx-select-container">
+      <input id="country-input" name="country" type="text" role="combobox" readonly
+             aria-haspopup="grid" aria-controls="country-input-listbox" aria-expanded="false"
+             autocomplete="none" class="cx-select-input" />
+      <button id="country-input-toggle-button" type="button" tabindex="-1" class="icon-dropdown-arrow"
+              aria-haspopup="grid" aria-controls="country-input-listbox"
+              aria-label="Open the drop-down list for Country."></button>
+    </div>
+  </div>
+
+  <div class="input-row">
+    <label class="input-row__label cx-select__label" for="state-input">State</label>
+    <div class="cx-select-container">
+      <input id="state-input" name="state" type="text" role="combobox" readonly
+             aria-haspopup="grid" aria-controls="state-input-listbox" aria-expanded="false"
+             autocomplete="none" class="cx-select-input" />
+      <button id="state-input-toggle-button" type="button" tabindex="-1" class="icon-dropdown-arrow"
+              aria-haspopup="grid" aria-controls="state-input-listbox"
+              aria-label="Open the drop-down list for State."></button>
+    </div>
+  </div>
+
+  <h1>Voluntary disclosures</h1>
+
+  <div class="input-row">
+    <label class="input-row__label cx-select__label" for="veteran-input">Veteran Status</label>
+    <div class="cx-select-container">
+      <input id="veteran-input" name="veteranStatus" type="text" role="combobox" readonly
+             aria-haspopup="grid" aria-controls="veteran-input-listbox" aria-expanded="false"
+             autocomplete="none" class="cx-select-input" />
+      <button id="veteran-input-toggle-button" type="button" tabindex="-1" class="icon-dropdown-arrow"
+              aria-haspopup="grid" aria-controls="veteran-input-listbox"
+              aria-label="Open the drop-down list for Veteran Status."></button>
+    </div>
+  </div>
+
+  <script>
+    // cx-select behavior per the oj-hcm-ce bundle source: click input/toggle →
+    // portal a GRID of gridcells into <body>; clicking a gridcell commits its
+    // text to the input and removes the portal.
+    function cxSelectGrid(baseId, options) {
+      const input = document.getElementById(baseId + '-input')
+      const toggle = document.getElementById(baseId + '-input-toggle-button')
+      const portalId = baseId + '-input-listbox'
+      const open = () => {
+        if (document.getElementById(portalId)) return
+        const portal = document.createElement('div')
+        portal.className = 'cx-select__options'
+        portal.innerHTML =
+          '<div class="cx-select__list" role="grid" id="' + portalId + '" tabindex="-1">' +
+          options
+            .map(
+              (o, i) =>
+                '<div role="row"><div tabindex="-1" role="gridcell" id="' + portalId + '-item-' + i +
+                '" aria-selected="false" class="cx-select__list-item"><span>' + o + '</span></div></div>',
+            )
+            .join('') +
+          '</div>'
+        document.body.appendChild(portal)
+        input.setAttribute('aria-expanded', 'true')
+        for (const cell of portal.querySelectorAll('[role="gridcell"]')) {
+          cell.addEventListener('click', () => {
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set
+            setter.call(input, cell.textContent.trim())
+            input.dispatchEvent(new Event('input', { bubbles: true }))
+            input.dispatchEvent(new Event('change', { bubbles: true }))
+            portal.remove()
+            input.setAttribute('aria-expanded', 'false')
+          })
+        }
+      }
+      input.addEventListener('click', open)
+      toggle.addEventListener('click', open)
+    }
+    cxSelectGrid('country', ['Canada', 'Mexico', 'United States'])
+    cxSelectGrid('state', ['Pennsylvania', 'Texas', 'Utah'])
+    cxSelectGrid('veteran', ['I am not a veteran', 'I am a veteran', 'I do not wish to answer'])
+  </script>
+</body>
+</html>

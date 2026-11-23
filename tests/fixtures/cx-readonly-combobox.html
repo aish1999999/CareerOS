@@ -1,0 +1,80 @@
+<!doctype html>
+<!-- NOV Oracle CX cx-select fixture (harness verification for the
+     readonly/search combobox-trigger detection fix, 2026-07-17 night).
+
+     Reproduces the two cx-select shapes seen on
+     egay.fa.us6.oraclecloud.com CX_4001:
+       • non-searchable  → <input role=combobox readonly> + toggle button
+       • searchable      → <input role=combobox type=search> + toggle button
+     Each combobox input carries aria-controls="<id>-listbox"; the companion
+     toggle button carries the SAME aria-controls (so the detector dedups it
+     against the DOM combobox). Pre-fix, the input is vetoed by the plain-input
+     rules (readonly / type=search) AND the button is deduped away → the whole
+     widget is invisible to detection and never fills.
+
+     The popup itself uses generic role=listbox/option markup so the fill path
+     runs on localhost WITHOUT the Oracle adapter (same trick as
+     cx-search.html). The bug under test is DETECTION, which is host-agnostic. -->
+<html lang="en">
+<head><meta charset="utf-8" /><title>cx-select readonly/search fixture</title></head>
+<body>
+  <h1>Candidate address</h1>
+
+  <!-- Non-searchable single cx-select: readonly combobox input -->
+  <div class="cx-select">
+    <label for="country-input">Country</label>
+    <input id="country-input" name="country" role="combobox" aria-haspopup="grid"
+           aria-controls="country-listbox" aria-expanded="false" readonly
+           autocomplete="none" />
+    <button id="country-toggle-button" type="button" tabindex="-1"
+            aria-haspopup="grid" aria-controls="country-listbox"
+            aria-label="Open the drop-down list for Country."></button>
+  </div>
+
+  <!-- Searchable single cx-select: type=search combobox input -->
+  <div class="cx-select">
+    <label for="city-input">City</label>
+    <input id="city-input" name="city" role="combobox" aria-haspopup="grid"
+           aria-controls="city-listbox" aria-expanded="false" type="search"
+           autocomplete="none" />
+    <button id="city-toggle-button" type="button" tabindex="-1"
+            aria-haspopup="grid" aria-controls="city-listbox"
+            aria-label="Open the drop-down list for City."></button>
+  </div>
+
+  <script>
+    // A cx-select: click the input OR the toggle button → portal a listbox of
+    // options into <body> → clicking an option commits it to the input.
+    function cxSelect(baseId, options) {
+      const input = document.getElementById(baseId + '-input')
+      const toggle = document.getElementById(baseId + '-toggle-button')
+      const portalId = baseId + '-listbox'
+      const open = () => {
+        if (document.getElementById(portalId)) return
+        const portal = document.createElement('div')
+        portal.id = portalId
+        portal.className = 'cx-select__options'
+        portal.innerHTML =
+          '<ul role="listbox">' +
+          options.map((o) => '<li role="option">' + o + '</li>').join('') +
+          '</ul>'
+        document.body.appendChild(portal)
+        input.setAttribute('aria-expanded', 'true')
+        for (const li of portal.querySelectorAll('[role="option"]')) {
+          li.addEventListener('click', () => {
+            input.value = li.textContent
+            input.setAttribute('aria-expanded', 'false')
+            portal.remove()
+            input.dispatchEvent(new Event('input', { bubbles: true }))
+            input.dispatchEvent(new Event('change', { bubbles: true }))
+          })
+        }
+      }
+      input.addEventListener('click', open)
+      toggle.addEventListener('click', open)
+    }
+    cxSelect('country', ['Canada', 'India', 'Mexico', 'United Kingdom', 'United States'])
+    cxSelect('city', ['Austin', 'Dallas', 'El Paso', 'Fort Worth', 'Houston', 'San Antonio'])
+  </script>
+</body>
+</html>

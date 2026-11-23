@@ -1,0 +1,308 @@
+import { z } from 'zod'
+import type { OptionSet, Profile, QAEntry, Settings, StoreData } from '@/types'
+
+export const SCHEMA_VERSION = 10
+
+/** Anthropic model for the LLM-first planner (Stage 2). The alias tracks the
+ *  latest Haiku snapshot (claude-haiku-4-5-20251001 as of writing) — fast and
+ *  the cheapest tier, which is what a per-page planning call wants. */
+export const DEFAULT_PLANNER_MODEL = 'claude-haiku-4-5'
+
+/** Domains where FlashFiller auto-activates out of the box — every ATS with
+ *  an adapter. Suffix-matched, so `successfactors.eu` covers
+ *  career5.successfactors.eu. Kept as one constant so the settings default
+ *  and the v3→v4 migration can't drift. */
+export const DEFAULT_ENABLED_DOMAINS = [
+  'boards.greenhouse.io',
+  'job-boards.greenhouse.io',
+  'jobs.lever.co',
+  'myworkdayjobs.com',
+  'jobs.ashbyhq.com',
+  'icims.com',
+  'jobs.smartrecruiters.com',
+  'successfactors.eu',
+  'successfactors.com',
+  // Oracle Recruiting Cloud Candidate Experience — tenants live on varied pod
+  // hosts (fa-espx-saasfaprod1.fa.ocs.oraclecloud.com, xyz.fa.us2.oraclecloud.com),
+  // so the shared suffix is the only stable handle. Broad, but this is a
+  // careers-only browsing profile and filling never happens without a match.
+  'oraclecloud.com',
+]
+
+// ---------------------------------------------------------------------------
+// Zod schemas (Section 9). Every field has a default so partial/older data
+// parses into a complete, well-typed store.
+// ---------------------------------------------------------------------------
+
+export const WorkHistorySchema = z.object({
+  company: z.string().default(''),
+  title: z.string().default(''),
+  startDate: z.string().default(''),
+  endDate: z.string().default(''),
+  location: z.string().default(''),
+  description: z.string().default(''),
+})
+
+export const EducationSchema = z.object({
+  institution: z.string().default(''),
+  degree: z.string().default(''),
+  field: z.string().default(''),
+  startDate: z.string().default(''),
+  endDate: z.string().default(''),
+})
+
+export const ProfileSchema = z.object({
+  firstName: z.string().default(''),
+  lastName: z.string().default(''),
+  email: z.string().default(''),
+  phone: z.string().default(''),
+  address: z
+    .object({
+      line1: z.string().default(''),
+      line2: z.string().default(''),
+      city: z.string().default(''),
+      state: z.string().default(''),
+      postalCode: z.string().default(''),
+      country: z.string().default(''),
+    })
+    .default({}),
+  links: z
+    .object({
+      linkedin: z.string().default(''),
+      github: z.string().default(''),
+      portfolio: z.string().default(''),
+      website: z.string().default(''),
+    })
+    .default({}),
+  accountEmail: z.string().default(''),
+  accountPassword: z.string().default(''),
+  earliestStartDate: z.string().default(''),
+  workAuthorization: z.string().default(''),
+  authorizedToWork: z.boolean().default(true),
+  requiresSponsorship: z.boolean().default(false),
+  previouslyEmployedHere: z.boolean().default(false),
+  willingToRelocate: z.boolean().default(true),
+  noticePeriod: z.string().default(''),
+  desiredSalary: z.string().default(''),
+  pronouns: z.string().default(''),
+  workHistory: z.array(WorkHistorySchema).default([]),
+  education: z.array(EducationSchema).default([]),
+  eeo: z
+    .object({
+      gender: z.string().default(''),
+      ethnicity: z.string().default(''),
+      veteranStatus: z.string().default(''),
+      disabilityStatus: z.string().default(''),
+    })
+    .default({}),
+})
+
+export const PageContextSchema = z.object({
+  company: z.string().nullable().default(null),
+  role: z.string().nullable().default(null),
+  location: z.string().nullable().default(null),
+  source: z.enum(['jsonld', 'meta', 'adapter', 'title', 'none']).default('none'),
+})
+
+export const QAEntrySchema = z.object({
+  id: z.string().min(1),
+  question: z.string().min(1),
+  aliases: z.array(z.string()).default([]),
+  answer: z.string().default(''),
+  answerType: z.enum(['text', 'profile', 'composite', 'notify']).default('text'),
+  answerMode: z.enum(['auto', 'judge']).default('auto'),
+  fallbacks: z.array(z.string()).optional(),
+  answerTemplate: z.string().nullable().default(null),
+  mapsTo: z.string().nullable().default(null),
+  variables: z.array(z.string()).default([]),
+  personas: z.array(z.string()).default([]),
+  tags: z.array(z.string()).default([]),
+  fieldType: z.string().default('text'),
+  options: z.array(z.string()).default([]),
+  status: z.enum(['active', 'needs_review']).default('active'),
+  source: z.enum(['training', 'captured', 'import', 'inferred']).default('import'),
+  captureContext: PageContextSchema.nullable().optional().default(null),
+  siteScope: z.string().nullable().default(null),
+  reviewNote: z.string().default(''),
+  lastWrongAt: z.number().nullable().default(null),
+  okCount: z.number().default(0),
+  wrongCount: z.number().default(0),
+  createdAt: z.number().default(0),
+  updatedAt: z.number().default(0),
+})
+
+export const SettingsSchema = z.object({
+  autoFillThreshold: z.number().min(0).max(1).default(0.85),
+  suggestThreshold: z.number().min(0).max(1).default(0.6),
+  overwriteFilled: z.boolean().default(false),
+  enabledDomains: z.array(z.string()).default(DEFAULT_ENABLED_DOMAINS),
+  // Per-host veto, checked FIRST by the activation predicate: fingerprint-
+  // activated vanity domains (careers.honeywell.com riding oraclecloud.com's
+  // enablement) have no enabledDomains entry to remove, so the popup's
+  // toggle-off pins the hostname here instead. Exact host + subdomains.
+  disabledDomains: z.array(z.string()).default([]),
+  captureLoopEnabled: z.boolean().default(true),
+  semanticMatching: z
+    .object({
+      enabled: z.boolean().default(false),
+      provider: z.string().default('none'),
+      apiKeyRef: z.string().nullable().default(null),
+      model: z.string().default('gpt-4o-mini'),
+    })
+    .default({}),
+  fillDelayMs: z.number().min(0).default(60),
+  personas: z.array(z.string()).default(['frontend', 'full-stack']),
+  activePersona: z.string().nullable().default(null),
+  autoInferPersona: z.boolean().default(true),
+  onboardingCompleted: z.boolean().default(false),
+  suppressedSeedIds: z.array(z.string()).default([]),
+  autoAttachDocuments: z.boolean().default(true),
+  // Stage 2 (LLM-first filling): off by default — 'assisted' is exactly the
+  // pre-Stage-2 behavior. The planner is Claude Haiku on the user's own
+  // Anthropic key, independent of the OpenAI judge above.
+  fillMode: z.enum(['assisted', 'llm-first']).default('assisted'),
+  planner: z
+    .object({
+      apiKeyRef: z.string().nullable().default(null),
+      model: z.string().default(DEFAULT_PLANNER_MODEL),
+    })
+    .default({}),
+})
+
+export const OptionSetSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().default(''),
+  options: z.array(z.string()).default([]),
+})
+
+export const StoreSchema = z.object({
+  schemaVersion: z.number().default(SCHEMA_VERSION),
+  profile: ProfileSchema.default({}),
+  qa: z.array(QAEntrySchema).default([]),
+  optionSets: z.array(OptionSetSchema).default([]),
+  settings: SettingsSchema.default({}),
+})
+
+export const SeedQuestionSchema = z.object({
+  id: z.string(),
+  category: z.string(),
+  question: z.string(),
+  aliases: z.array(z.string()).default([]),
+  fieldType: z.string().default('text'),
+  answerType: z.enum(['profile', 'freeText', 'composite', 'notify']),
+  mapsTo: z.string().nullable().default(null),
+  answerTemplate: z.string().nullable().default(null),
+  variables: z.array(z.string()).default([]),
+  autofillByDefault: z.boolean().default(true),
+  guidance: z.string().optional(),
+  fallbacks: z.array(z.string()).optional(),
+})
+
+export const SeedCatalogSchema = z.object({
+  schemaVersion: z.number(),
+  note: z.string().default(''),
+  categories: z.array(z.object({ id: z.string(), label: z.string() })),
+  questions: z.array(SeedQuestionSchema),
+})
+
+// ---------------------------------------------------------------------------
+// Factories & import validation
+// ---------------------------------------------------------------------------
+
+export function defaultProfile(): Profile {
+  return ProfileSchema.parse({})
+}
+
+export function defaultSettings(): Settings {
+  return SettingsSchema.parse({})
+}
+
+export function defaultStore(): StoreData {
+  return StoreSchema.parse({})
+}
+
+export interface ImportResult {
+  ok: boolean
+  data: Partial<StoreData> | null
+  /** Entries that failed validation, with the reason (Section 9: annotate malformed). */
+  rejected: { index: number; question?: string; reason: string }[]
+  errors: string[]
+}
+
+/**
+ * Validate an import payload: a full store export or any subset of
+ * { profile, qa, optionSets, settings }. Malformed qa entries are rejected
+ * individually with a reason; a malformed profile/settings blob rejects that
+ * whole section.
+ */
+export function validateImport(payload: unknown): ImportResult {
+  const result: ImportResult = { ok: false, data: null, rejected: [], errors: [] }
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+    result.errors.push('Import must be a JSON object with any of: profile, qa, settings.')
+    return result
+  }
+  const obj = payload as Record<string, unknown>
+  const data: Partial<StoreData> = {}
+
+  if (obj.profile !== undefined) {
+    const parsed = ProfileSchema.safeParse(obj.profile)
+    if (parsed.success) data.profile = parsed.data
+    else result.errors.push(`profile: ${parsed.error.issues[0]?.message ?? 'invalid'}`)
+  }
+  if (obj.settings !== undefined) {
+    const parsed = SettingsSchema.safeParse(obj.settings)
+    if (parsed.success) data.settings = parsed.data
+    else result.errors.push(`settings: ${parsed.error.issues[0]?.message ?? 'invalid'}`)
+  }
+  if (obj.qa !== undefined) {
+    if (!Array.isArray(obj.qa)) {
+      result.errors.push('qa: must be an array of Q&A entries.')
+    } else {
+      const entries: QAEntry[] = []
+      obj.qa.forEach((raw, index) => {
+        const parsed = QAEntrySchema.safeParse(raw)
+        if (parsed.success) {
+          entries.push(parsed.data as QAEntry)
+        } else {
+          const issue = parsed.error.issues[0]
+          const q =
+            typeof raw === 'object' && raw !== null && 'question' in raw
+              ? String((raw as Record<string, unknown>).question)
+              : undefined
+          result.rejected.push({
+            index,
+            question: q,
+            reason: `${issue?.path.join('.') || 'entry'}: ${issue?.message ?? 'invalid'}`,
+          })
+        }
+      })
+      data.qa = entries
+    }
+  }
+
+  if (obj.optionSets !== undefined) {
+    if (!Array.isArray(obj.optionSets)) {
+      result.errors.push('optionSets: must be an array of option sets.')
+    } else {
+      const sets: OptionSet[] = []
+      for (const raw of obj.optionSets) {
+        const parsed = OptionSetSchema.safeParse(raw)
+        if (parsed.success) sets.push(parsed.data as OptionSet)
+      }
+      data.optionSets = sets
+    }
+  }
+
+  if (
+    data.profile === undefined &&
+    data.qa === undefined &&
+    data.optionSets === undefined &&
+    data.settings === undefined
+  ) {
+    result.errors.push('Nothing importable found. Expected keys: profile, qa, optionSets, settings.')
+    return result
+  }
+  result.ok = result.errors.length === 0
+  result.data = data
+  return result
+}

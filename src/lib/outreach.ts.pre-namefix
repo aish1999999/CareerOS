@@ -1,0 +1,1108 @@
+// ---------------------------------------------------------------------------
+// LinkedIn outreach (Stage 8) — the model layer the outreach panel sits on.
+//
+// One person, read once, messaged once, logged twice:
+//
+//   captureActiveTabProfile()  ONE chrome.scripting read of the active tab, and only when the
+//                              human presses the button (D13, the same rule the job capture
+//                              follows). Nothing observes a page, nothing polls, nothing runs on
+//                              open. A tab that is not a linkedin.com/in/… profile is refused with
+//                              the address it wanted.
+//   getTemplates() /           thin calls to the hub's Stage 8 routes. The bank, the fill and the
+//   draftMessage() /           hard checks all live in apps/mapper/service/outreach.py — this file
+//   tightenMessage()           never re-implements a rule, so there is one place a rule can change.
+//                              tighten is THE ONLY ONE THAT SPENDS, and only on a button.
+//   saveLead()                 upserts the `leads` row through the hub outbox on the hub's own key
+//                              (user_id, linkedin_url) — the same person from two tabs is one row.
+//   recordSent()               the human pressed Send in LinkedIn, then pressed our button: one
+//                              `messages` row with sent_at, and the lead moves to `messaged`.
+//
+// WHAT NOTHING HERE DOES. Nothing on LinkedIn is sent, clicked, or watched by code — the human
+// sends, and the human says so. The stand-out skill is typed by hand (Bob, 2026-09-07): no model
+// call and no heuristic in this file fills it, so nothing can put words in his mouth. And no route
+// in this file collects an email: writing `sent_at` is what makes the hub do that (see recordSent).
+//
+// Lives beside content/ — nothing here touches the fill, the detector, the matcher or the page.
+// ---------------------------------------------------------------------------
+
+import { ENTITY_COLUMNS, LEAD_AGE_BRACKET, LEAD_GENDER } from '@contract/entities'
+import type {
+  LeadAgeBracket,
+  LeadGender,
+  LeadReachOutReason,
+  LeadStatus,
+  MessageKind,
+} from '@contract/entities'
+import { flushHubOutbox, getHubDeadLetters, getHubOutbox, hubInsert, hubUpdate, hubUpsert } from '@/lib/hub'
+import {
+  parseLinkedInProfile, suggestAgeBracket, suggestGender,
+  type LinkedInProfile as AdapterProfile,
+} from '@/content/adapters/linkedin/profile'
+import { grabPage } from '@/lib/job-capture'
+import { getTailorConfig } from '@/lib/tailor'
+import { assertAllowedTailorUrl } from '@/lib/tailor-url'
+
+/** What became of a call. The vocabulary lib/applications.ts uses, so one status pill renders both. */
+export type OutreachStatus = 'sent' | 'queued' | 'dead' | 'error'
+
+/** Every export below returns at least this, and none of them ever throws at a caller. */
+export interface OutreachOutcome {
+  status: OutreachStatus
+  /** One sentence for the status line: what happened, and what to do about it. */
+  note: string
+}
+
+// ---- settings: what Bob types once and reuses ------------------------------------------------
+//
+// Its own storage key, never lib/schema.ts and never the main store — the same separation
+// lib/documents.ts and lib/applications.ts keep. The main store is zod-parsed on every read and a
+// panel preference has no business inside it.
+
+export const OUTREACH_SETTINGS_KEY = 'flashfiller_outreach_v1'
+/** Enough target roles to cover a search; more than that is a list nobody reads. */
+export const TARGET_ROLES_MAX = 20
+
+export type OutreachTone = 'casual' | 'professional'
+
+export interface OutreachSettings {
+  /** `[Your Skillset]`. Typed by hand — nothing derives it from the profile or the résumé. */
+  skillset: string
+  /** Every `[Your Target Role]` he has typed, newest first. Grows as he types new ones. */
+  targetRoles: string[]
+  /** The one the panel opens with. */
+  lastTargetRole: string
+  tone: OutreachTone
+}
+
+export interface SettingsOutcome extends OutreachOutcome {
+  settings: OutreachSettings
+}
+
+const DEFAULT_SETTINGS: OutreachSettings = { skillset: '', targetRoles: [], lastTargetRole: '', tone: 'casual' }
+
+function asSettings(raw: Partial<OutreachSettings> | undefined): OutreachSettings {
+  const roles = Array.isArray(raw?.targetRoles)
+    ? raw.targetRoles.filter((r): r is string => typeof r === 'string' && !!r.trim()).slice(0, TARGET_ROLES_MAX)
+    : []
+  return {
+    skillset: typeof raw?.skillset === 'string' ? raw.skillset : '',
+    targetRoles: roles,
+    lastTargetRole: typeof raw?.lastTargetRole === 'string' ? raw.lastTargetRole : '',
+    tone: raw?.tone === 'professional' ? 'professional' : 'casual',
+  }
+}
+
+/** The stored settings, or the defaults. A storage that cannot be read yields an empty panel he can
+ *  type into, never a broken one. */
+export async function getOutreachSettings(): Promise<OutreachSettings> {
+  try {
+    const result = await chrome.storage.local.get(OUTREACH_SETTINGS_KEY)
+    return asSettings(result[OUTREACH_SETTINGS_KEY] as Partial<OutreachSettings> | undefined)
+  } catch {
+    return { ...DEFAULT_SETTINGS }
+  }
+}
+
+/** Merge a patch over what is stored. Says so when the write did not happen — a preference that
+ *  silently failed to save is a preference he will type again tomorrow. */
+export async function setOutreachSettings(patch: Partial<OutreachSettings>): Promise<SettingsOutcome> {
+  const current = await getOutreachSettings()
+  const next = asSettings({ ...current, ...patch })
+  try {
+    await chrome.storage.local.set({ [OUTREACH_SETTINGS_KEY]: next })
+    return { status: 'sent', note: 'Saved.', settings: next }
+  } catch (e) {
+    return { status: 'error', note: `Not saved — ${e instanceof Error ? e.message : String(e)}`, settings: current }
+  }
+}
+
+/** The remembered list after typing `role`: newest first, one entry per role whatever its casing
+ *  ("Reliability Engineer" typed again does not become a second line), capped. Pure. */
+export function withTargetRole(roles: string[], role: string): string[] {
+  const clean = role.trim()
+  const kept = roles.map((r) => r.trim()).filter(Boolean)
+  if (!clean) return kept.slice(0, TARGET_ROLES_MAX)
+  const rest = kept.filter((r) => r.toLowerCase() !== clean.toLowerCase())
+  return [clean, ...rest].slice(0, TARGET_ROLES_MAX)
+}
+
+/** Remember a target role he just typed, and open on it next time. */
+export async function addTargetRole(role: string): Promise<SettingsOutcome> {
+  const current = await getOutreachSettings()
+  const targetRoles = withTargetRole(current.targetRoles, role)
+  const clean = role.trim()
+  return setOutreachSettings({ targetRoles, ...(clean ? { lastTargetRole: clean } : {}) })
+}
+
+// ---- the drafted note, across an unmount ------------------------------------------------------
+//
+// Its own storage key, never lib/schema.ts and never the main store — the separation
+// lib/documents.ts, lib/applications.ts and lib/comments.ts all keep.
+//
+// WHY A DRAFTED NOTE IS WORTH STORING AT ALL: the panel is rendered CONDITIONALLY in both surfaces
+// (App.tsx `{tab === 'Outreach' && <OutreachPanel/>}`, sidepanel/main.tsx), so switching to any
+// other tab destroys every piece of state it holds — and the popup closes the moment he clicks the
+// LinkedIn page behind it, which is the page he has to read to write the note. Until now the note
+// lived in React state and in the HTTP response and nowhere else, so the ordinary act of doing the
+// task threw it away.
+//
+// WHAT IS NOT STORED, AND WHY: the hub's verdict. A verdict was true of a moment, not of a note —
+// service/outreach.py's gate can change between one open and the next — and "I sent it" is dead on
+// an unchecked message precisely because an ungated send is the silent fallback this project
+// refuses (see sendBlockers in OutreachPanel.tsx). So a restored note comes back readable, copyable
+// and UNSENDABLE until the hub has looked at it again, which costs nothing. The store physically
+// cannot hold a pass, so no later bug can resurrect one.
+//
+// EVICTION is the week, the cap, and pressing "Read this profile". The record names a real person
+// and carries their headline, employer, location and the inferred bracket and gender — the same
+// data the lead row already holds, kept locally for as long as the note is worth having.
+
+export const OUTREACH_DRAFTS_KEY = 'flashfiller_outreach_drafts_v1'
+export const OUTREACH_DRAFTS_SCHEMA_VERSION = 1
+/** The people drafted for and not yet written to. More than this is a backlog, not a memory. */
+export const OUTREACH_DRAFTS_MAX = 10
+/** One working week. Drafted Monday over coffee, sent Friday when the connect quota resets. Longer
+ *  than Stage 6's twelve hours because that answers "am I in the same sitting" and this answers "is
+ *  this still the note I meant to send" — and a TIGHTENED note is the one thing on that screen that
+ *  cost money and cannot be recreated for free. */
+export const OUTREACH_DRAFT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+
+export interface StoredOutreachDraft {
+  /** Canonical `https://www.linkedin.com/in/<slug>` — the key, and the SAME key saveLead upserts
+   *  the lead on, so a note and its person cannot come apart. */
+  profileUrl: string
+  /** The person as the reader handed them over, unreduced: `send` needs every field. */
+  profile: LinkedInProfile
+  /** The chips as he left them. A confirmed suggestion is not the same fact as a guess, and that
+   *  difference is what `age_gender_confirmed` records. */
+  bracket: LeadAgeBracket
+  gender: LeadGender
+  ageConfirmed: boolean
+  genderConfirmed: boolean
+  /** The two boxes only he fills. */
+  company: string
+  standoutSkill: string
+  /** Which of the 20 this was, so a restored note still writes `template_key` on its messages row. */
+  templateKey: string | null
+  tone: OutreachTone
+  /** The five slots as they stood when the hub answered, so the re-check gates the same words
+   *  against the same values. */
+  values: OutreachValues
+  text: string
+  /** Set once "I sent it" landed. Restored so the button stays LATCHED — a restored note with a
+   *  live send button is a second `messages` row for one invitation. */
+  sentAt: string | null
+  savedAt: number
+}
+
+export type OutreachDraftInput = Omit<StoredOutreachDraft, 'profileUrl' | 'savedAt'>
+
+interface OutreachDraftsEnvelope {
+  schemaVersion: number
+  drafts: StoredOutreachDraft[]
+}
+
+/** Tolerant per-entry read, applied on BOTH the read and the write (the `asSettings` convention).
+ *  Null unless it can be keyed to a person and actually holds words. */
+function asDraft(raw: unknown): StoredOutreachDraft | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Partial<StoredOutreachDraft>
+  const profile = (r.profile ?? null) as LinkedInProfile | null
+  const key = profileUrl(r.profileUrl ?? profile?.linkedinUrl ?? null)
+  if (!key || !profile || typeof profile !== 'object') return null
+  if (typeof r.text !== 'string' || !r.text.trim()) return null
+  if (typeof r.savedAt !== 'number' || !Number.isFinite(r.savedAt)) return null
+  return {
+    profileUrl: key.canonical,
+    // Rewrite the profile's own URL to the canonical key so the record cannot disagree with itself.
+    profile: { ...profile, linkedinUrl: key.canonical },
+    bracket: LEAD_AGE_BRACKET.includes(r.bracket as LeadAgeBracket) ? (r.bracket as LeadAgeBracket) : 'unknown',
+    gender: LEAD_GENDER.includes(r.gender as LeadGender) ? (r.gender as LeadGender) : 'unknown',
+    ageConfirmed: r.ageConfirmed === true,
+    genderConfirmed: r.genderConfirmed === true,
+    company: typeof r.company === 'string' ? r.company : '',
+    standoutSkill: typeof r.standoutSkill === 'string' ? r.standoutSkill : '',
+    templateKey: typeof r.templateKey === 'string' ? r.templateKey : null,
+    tone: r.tone === 'professional' ? 'professional' : 'casual',
+    values: (r.values && typeof r.values === 'object' ? r.values : {}) as OutreachValues,
+    text: r.text,
+    sentAt: typeof r.sentAt === 'string' ? r.sentAt : null,
+    savedAt: r.savedAt,
+  }
+}
+
+/**
+ * Pure. The list after `draft` is written: newest first, ONE entry per person (a redraft replaces
+ * their old note rather than stacking beside it), nothing past a week, capped. The shape
+ * lib/validation-report.ts keeps — this is the working set of people not yet written to, not a
+ * history of everyone ever drafted for.
+ */
+export function withOutreachDraft(
+  drafts: StoredOutreachDraft[],
+  draft: StoredOutreachDraft,
+  now: number = Date.now(),
+): StoredOutreachDraft[] {
+  const fresh = drafts.filter((d) => d.profileUrl !== draft.profileUrl && now - d.savedAt <= OUTREACH_DRAFT_MAX_AGE_MS)
+  return [draft, ...fresh].slice(0, OUTREACH_DRAFTS_MAX)
+}
+
+/**
+ * Pure. Is this stored note THIS person's, and still worth showing? Canonicalises both sides, so a
+ * note filed under `https://www.linkedin.com/in/priya` answers a tab opened at
+ * `in.linkedin.com/in/Priya/?originalSubdomain=in` — one person, one key, the rule `profileUrl`
+ * already enforces for leads. `now` is a parameter so the expiry is testable without a clock.
+ */
+export function draftIsFor(
+  draft: StoredOutreachDraft | null | undefined,
+  linkedinUrl: string | null | undefined,
+  now: number = Date.now(),
+): boolean {
+  if (!draft || !draft.text.trim()) return false
+  const want = profileUrl(linkedinUrl)
+  const have = profileUrl(draft.profileUrl)
+  if (!want || !have || want.canonical !== have.canonical) return false
+  return now - draft.savedAt <= OUTREACH_DRAFT_MAX_AGE_MS
+}
+
+async function readDrafts(): Promise<StoredOutreachDraft[]> {
+  try {
+    const result = await chrome.storage.local.get(OUTREACH_DRAFTS_KEY)
+    const raw = result[OUTREACH_DRAFTS_KEY] as Partial<OutreachDraftsEnvelope> | undefined
+    const list = Array.isArray(raw?.drafts) ? raw.drafts : []
+    const out: StoredOutreachDraft[] = []
+    for (const entry of list) {
+      const draft = asDraft(entry)
+      if (draft) out.push(draft)
+    }
+    return out
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Write this person's note down. Silent and void: a note that failed to store is a note still on
+ * screen, and a status line about storage is a status line not about his message. Refuses a subject
+ * it cannot key — no canonical profile URL, or no words — because a draft filed under nothing would
+ * come back for everybody.
+ */
+export async function saveOutreachDraft(draft: OutreachDraftInput, now: number = Date.now()): Promise<void> {
+  const entry = asDraft({ ...draft, savedAt: now })
+  if (!entry) return
+  try {
+    const drafts = withOutreachDraft(await readDrafts(), entry, now)
+    await chrome.storage.local.set({
+      [OUTREACH_DRAFTS_KEY]: { schemaVersion: OUTREACH_DRAFTS_SCHEMA_VERSION, drafts } satisfies OutreachDraftsEnvelope,
+    })
+  } catch {
+    // The note is on screen; losing the copy is not news he can act on.
+  }
+}
+
+/** The note left for this person, or null on ANY doubt: no such person, a corrupt payload, a record
+ *  older than a week, a store that cannot be read. Null is always the safe answer — it costs one
+ *  press of Generate, and Generate costs nothing. */
+export async function loadOutreachDraft(
+  linkedinUrl: string | null | undefined,
+  now: number = Date.now(),
+): Promise<StoredOutreachDraft | null> {
+  const key = profileUrl(linkedinUrl)
+  if (!key) return null
+  const drafts = await readDrafts()
+  return drafts.find((d) => draftIsFor(d, key.canonical, now)) ?? null
+}
+
+/** Every stored note, newest first and already pruned. */
+export async function loadOutreachDrafts(now: number = Date.now()): Promise<StoredOutreachDraft[]> {
+  return (await readDrafts()).filter((d) => now - d.savedAt <= OUTREACH_DRAFT_MAX_AGE_MS)
+}
+
+/** Forget this person's note, so the store can never contradict the screen. A note wiped by "Read
+ *  this profile" that came back on the next tab switch would be a ghost, and this panel does not do
+ *  ghosts. Only this person's entry goes — someone else's unsent note is not this press's business. */
+export async function clearOutreachDraft(linkedinUrl: string | null | undefined): Promise<void> {
+  const key = profileUrl(linkedinUrl)
+  if (!key) return
+  try {
+    const drafts = (await readDrafts()).filter((d) => d.profileUrl !== key.canonical)
+    await chrome.storage.local.set({
+      [OUTREACH_DRAFTS_KEY]: { schemaVersion: OUTREACH_DRAFTS_SCHEMA_VERSION, drafts } satisfies OutreachDraftsEnvelope,
+    })
+  } catch {
+    // nothing to clear
+  }
+}
+
+/**
+ * The canonical profile URL of the page this panel is open over, or null when that tab is not a
+ * LinkedIn profile.
+ *
+ * This reads the TAB'S ADDRESS and nothing else — no `chrome.scripting`, no DOM, no page content.
+ * "Read this profile" is still the only thing that opens the page; this only asks which page it
+ * would be, so a restored note can be checked against the person actually on screen. It is the same
+ * `chrome.tabs.query` that lib/applications.ts already relies on for the session capture.
+ */
+export async function activeProfileUrl(): Promise<string | null> {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+    return profileUrl(typeof tab?.url === 'string' ? tab.url : null)?.canonical ?? null
+  } catch {
+    return null
+  }
+}
+
+/** One call for the panel's restore: resolve the tab, read the store, gate on both the person and
+ *  the week. Null when he is not on a profile — the note is not lost, it is filed under someone
+ *  whose page he is not looking at. */
+export async function loadDraftForActiveProfile(now: number = Date.now()): Promise<StoredOutreachDraft | null> {
+  const url = await activeProfileUrl()
+  return url ? loadOutreachDraft(url, now) : null
+}
+
+// ---- the profile page ---------------------------------------------------------------------
+
+/**
+ * One person, as this extension knows them. THIS is the shape the panel renders and saveLead maps
+ * to `leads` columns; the DOM work that fills it belongs to content/adapters/linkedin/, which
+ * `readProfileWithAdapter` calls and which any caller may replace by handing a different parser to
+ * captureActiveTabProfile. The adapter is imported the way lib/job-capture.ts imports
+ * content/adapters/postings/ — from a lib module, so it never enters the content-script bundle —
+ * and the parser stays a parameter so a test can read a page without one.
+ */
+export interface LinkedInProfile {
+  /** Canonical `https://www.linkedin.com/in/<slug>` — the hub's upsert key for this person. */
+  linkedinUrl: string
+  slug: string | null
+  fullName: string | null
+  firstName: string | null
+  lastName: string | null
+  headline: string | null
+  company: string | null
+  companyDomain: string | null
+  roleTitle: string | null
+  location: string | null
+  /** Two or three lines about them, for the panel and for `leads.background`. */
+  background: string | null
+  /** SUGGESTIONS, and only ever suggestions — the human confirms or flips them before they are
+   *  saved (age_gender_confirmed). Null means nothing was suggested, never "unknown". */
+  suggestedBracket: LeadAgeBracket | null
+  suggestedGender: LeadGender | null
+  /** Why each suggestion was reached, in the reader's own words. This is what makes a chip
+   *  confirmable: a suggestion whose reasoning is not on screen is indistinguishable from a guess. */
+  bracketWhy: string | null
+  genderWhy: string | null
+  /** Which layer supplied each field, for the panel's "where did this come from". */
+  layers: Record<string, string>
+}
+
+/** What content/adapters/linkedin/ supplies: a document and its URL in, whatever it could read out.
+ *  Anything it leaves out falls back to the page's own structured data. */
+export type ProfileParser = (doc: Document, url: string) => Partial<LinkedInProfile> | null
+
+export interface ProfileCapture extends OutreachOutcome {
+  profile: LinkedInProfile | null
+  /** The tab's <title>, exactly as the page wrote it — unparsed, so the panel can show what it read. */
+  pageTitle: string | null
+  /** The tab's own URL, kept even on a refusal so the message can name what it found. */
+  url: string | null
+}
+
+const PROFILE_PATH = /^\/in\/([^/?#]+)/i
+
+function isLinkedInHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.$/, '')
+  return host === 'linkedin.com' || host.endsWith('.linkedin.com')
+}
+
+/**
+ * The canonical profile URL and its vanity slug, or null when this is not a profile page.
+ *
+ * Canonical because it is the upsert key: `in.linkedin.com/in/Foo/?originalSubdomain=in`,
+ * `www.linkedin.com/in/foo`, and a link with a tracking query are ONE person, so they must produce
+ * one string. The slug is lower-cased for the same reason — LinkedIn treats the vanity name
+ * case-insensitively, and a key that does not would file the same person twice.
+ */
+export function profileUrl(url: string | null | undefined): { canonical: string; slug: string } | null {
+  if (!url) return null
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return null
+  }
+  if (!/^https?:$/i.test(parsed.protocol) || !isLinkedInHost(parsed.hostname)) return null
+  const match = PROFILE_PATH.exec(parsed.pathname)
+  if (!match) return null
+  let slug: string
+  try {
+    slug = decodeURIComponent(match[1]).trim().toLowerCase()
+  } catch {
+    slug = match[1].trim().toLowerCase()
+  }
+  if (!slug) return null
+  return { canonical: `https://www.linkedin.com/in/${slug}`, slug }
+}
+
+function text(value: unknown, max = 300): string | null {
+  if (typeof value !== 'string') return null
+  const clean = value.replace(/\s+/g, ' ').trim()
+  if (!clean) return null
+  return clean.length <= max ? clean : clean.slice(0, max).trim()
+}
+
+function metaOf(doc: Document, property: string): string | null {
+  const el = doc.querySelector(`meta[property="${property}"], meta[name="${property}"]`)
+  return text(el?.getAttribute('content'), 600)
+}
+
+function findPerson(node: unknown): Record<string, unknown> | null {
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findPerson(item)
+      if (found) return found
+    }
+    return null
+  }
+  if (typeof node !== 'object' || node === null) return null
+  const obj = node as Record<string, unknown>
+  const type = obj['@type']
+  if (type === 'Person' || (Array.isArray(type) && type.includes('Person'))) return obj
+  if (obj['@graph']) return findPerson(obj['@graph'])
+  return null
+}
+
+function hostOf(value: unknown): string | null {
+  if (typeof value !== 'string' || !value) return null
+  try {
+    return new URL(value).hostname.toLowerCase().replace(/^www\./, '')
+  } catch {
+    return null
+  }
+}
+
+/** "(3) Aishwar Ravichandran - Reliability Engineer | LinkedIn" → the two halves. */
+function splitProfileTitle(title: string | null): { name: string | null; headline: string | null } {
+  if (!title) return { name: null, headline: null }
+  const stripped = title.replace(/^\(\d+\)\s*/, '').replace(/\s*\|\s*LinkedIn\s*$/i, '').trim()
+  // A page still hydrating just says "LinkedIn". That is not a person, and a lead named "LinkedIn"
+  // would be worse than no lead at all — the capture refuses instead, and asks for a reload.
+  if (!stripped || /^linkedin$/i.test(stripped)) return { name: null, headline: null }
+  const dash = stripped.split(/\s+[-–—]\s+/)
+  if (dash.length > 1) return { name: text(dash[0], 120), headline: text(dash.slice(1).join(' - '), 300) }
+  return { name: text(stripped, 120), headline: null }
+}
+
+function splitName(full: string | null): { first: string | null; last: string | null } {
+  if (!full) return { first: null, last: null }
+  const parts = full.split(/\s+/).filter(Boolean)
+  if (parts.length === 0) return { first: null, last: null }
+  if (parts.length === 1) return { first: parts[0], last: null }
+  return { first: parts[0], last: parts.slice(1).join(' ') }
+}
+
+/**
+ * What any profile page states about itself — JSON-LD `Person`, then Open Graph, then the page
+ * title. Deliberately structural: it reads no LinkedIn class name and infers no age or gender, so
+ * it neither duplicates nor competes with content/adapters/linkedin/. It is the floor under the
+ * adapter, not a second one, and it is what runs when no parser is handed in.
+ */
+export function readProfileDocument(doc: Document, url: string): Partial<LinkedInProfile> {
+  const layers: Record<string, string> = {}
+  let person: Record<string, unknown> | null = null
+  for (const script of Array.from(doc.querySelectorAll('script[type="application/ld+json"]'))) {
+    try {
+      person = findPerson(JSON.parse(script.textContent ?? ''))
+    } catch {
+      continue
+    }
+    if (person) break
+  }
+
+  const titleParts = splitProfileTitle(text(doc.title, 400) ?? metaOf(doc, 'og:title'))
+  const worksFor = person?.worksFor
+  const employer = (Array.isArray(worksFor) ? worksFor[0] : worksFor) as Record<string, unknown> | string | undefined
+  const address = person?.address as Record<string, unknown> | string | undefined
+
+  const put = <T>(field: string, candidates: [T | null | undefined, string][]): T | null => {
+    for (const [value, layer] of candidates) {
+      if (value !== null && value !== undefined && value !== '') {
+        layers[field] = layer
+        return value
+      }
+    }
+    return null
+  }
+
+  const fullName = put<string>('fullName', [
+    [text(person?.name, 120), 'jsonld'],
+    [titleParts.name, 'title'],
+  ])
+  // jobTitle is a string on most pages and a list on a few; both read the same way
+  const jobTitle = Array.isArray(person?.jobTitle) ? (person?.jobTitle as unknown[])[0] : person?.jobTitle
+  const headline = put<string>('headline', [
+    [text(jobTitle, 300), 'jsonld'],
+    [titleParts.headline, 'title'],
+    [metaOf(doc, 'og:description'), 'meta'],
+  ])
+  const company = put<string>('company', [
+    [typeof employer === 'string' ? text(employer, 160) : text(employer?.name, 160), 'jsonld'],
+  ])
+  const location = put<string>('location', [
+    [typeof address === 'string' ? text(address, 160) : text(address?.addressLocality, 160), 'jsonld'],
+    [typeof address === 'object' && address ? text(address.addressRegion, 160) : null, 'jsonld'],
+  ])
+  const background = put<string>('background', [
+    [text(person?.description, 600), 'jsonld'],
+  ])
+  const companyDomain = put<string>('companyDomain', [
+    [typeof employer === 'object' && employer ? hostOf(employer.url) ?? hostOf(employer.sameAs) : null, 'jsonld'],
+  ])
+
+  const { first, last } = splitName(fullName)
+  const slug = profileUrl(url)?.slug ?? null
+  return {
+    slug,
+    fullName,
+    firstName: first,
+    lastName: last,
+    headline,
+    company,
+    companyDomain,
+    // A headline is not a job title. Only JSON-LD's own jobTitle earns role_title; otherwise the
+    // panel shows the headline and the human types the title if it matters.
+    roleTitle: text(person?.jobTitle, 160),
+    location,
+    background,
+    // Nothing here suggests an age bracket or a gender. Both are the adapter's reading of education
+    // years and pronouns, and both stay suggestions the human confirms.
+    suggestedBracket: null,
+    suggestedGender: null,
+    layers,
+  }
+}
+
+function toProfile(partial: Partial<LinkedInProfile> | null, canonical: string, url: string): LinkedInProfile {
+  const p = partial ?? {}
+  const named = p.fullName ?? null
+  const split = splitName(named)
+  return {
+    linkedinUrl: canonical,
+    slug: p.slug ?? profileUrl(url)?.slug ?? null,
+    fullName: named,
+    firstName: p.firstName ?? split.first,
+    lastName: p.lastName ?? split.last,
+    headline: p.headline ?? null,
+    company: p.company ?? null,
+    companyDomain: p.companyDomain ?? null,
+    roleTitle: p.roleTitle ?? null,
+    location: p.location ?? null,
+    background: p.background ?? null,
+    suggestedBracket: p.suggestedBracket ?? null,
+    suggestedGender: p.suggestedGender ?? null,
+    bracketWhy: p.bracketWhy ?? null,
+    genderWhy: p.genderWhy ?? null,
+    layers: p.layers ?? {},
+  }
+}
+
+/**
+ * The default reader: the LinkedIn adapter first, this module's structured-data reading behind it.
+ *
+ * The adapter knows the page's own markup — the experience and education sections a profile renders,
+ * which is where the age bracket comes from, and the pronouns, which are the only thing gender is
+ * ever read from. Where it finds nothing, the page's JSON-LD still yields a name, a headline and an
+ * employer, so a LinkedIn layout change degrades the reading rather than emptying it.
+ *
+ * Both suggestions arrive with their reasoning attached, because the human confirms or flips them.
+ */
+export function readProfileWithAdapter(doc: Document, url: string): Partial<LinkedInProfile> {
+  const base = readProfileDocument(doc, url)
+  let adapted: AdapterProfile | null = null
+  try {
+    adapted = parseLinkedInProfile(doc, url)
+  } catch {
+    return base                                  // a throwing adapter costs its half, not the read
+  }
+  const layers = { ...(base.layers ?? {}) }
+  const prefer = <T>(field: string, fromAdapter: T | null | undefined, fallback: T | null | undefined): T | null => {
+    if (fromAdapter !== null && fromAdapter !== undefined && fromAdapter !== ('' as unknown as T)) {
+      layers[field] = 'adapter'
+      return fromAdapter
+    }
+    return (fallback ?? null) as T | null
+  }
+  const age = suggestAgeBracket(adapted)
+  const sex = suggestGender(adapted)
+  return {
+    ...base,
+    fullName: prefer('fullName', adapted.fullName, base.fullName),
+    firstName: prefer('firstName', adapted.firstName, base.firstName),
+    lastName: prefer('lastName', adapted.lastName, base.lastName),
+    headline: prefer('headline', adapted.headline, base.headline),
+    company: prefer('company', adapted.company, base.company),
+    companyDomain: prefer('companyDomain', adapted.companyDomain, base.companyDomain),
+    roleTitle: prefer('roleTitle', adapted.roleTitle, base.roleTitle),
+    location: prefer('location', adapted.location, base.location),
+    background: prefer('background', adapted.about, base.background),
+    suggestedBracket: age.bracket === 'unknown' ? null : (age.bracket as LeadAgeBracket),
+    suggestedGender: sex.gender === 'unknown' ? null : (sex.gender as LeadGender),
+    bracketWhy: age.why,
+    genderWhy: sex.why,
+    layers,
+  }
+}
+
+/**
+ * Read the person in the active tab. ONE injected read, on the button press and nowhere else — no
+ * observer, no interval, no listener on a LinkedIn page. The page is only READ: chrome.scripting
+ * returns an HTML snapshot and every bit of parsing happens on this side, so nothing this extension
+ * runs can click, type or send anything on LinkedIn.
+ *
+ * `parse` is where content/adapters/linkedin/ plugs in. Its absence is not a failure: the page's own
+ * structured data still yields a name and a headline, and the note says which reading it got.
+ */
+export async function captureActiveTabProfile(parse: ProfileParser = readProfileWithAdapter): Promise<ProfileCapture> {
+  let url: string | null = null
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+    url = typeof tab?.url === 'string' ? tab.url : null
+    if (!tab?.id || !url) {
+      return { status: 'error', profile: null, pageTitle: null, url, note: 'No page open — open the person’s LinkedIn profile (a linkedin.com/in/… page) in this tab and press this again.' }
+    }
+    const target = profileUrl(url)
+    if (!target) {
+      let where = url
+      try {
+        where = new URL(url).hostname + new URL(url).pathname
+      } catch {
+        /* an opaque URL: name it as it came */
+      }
+      return {
+        status: 'error', profile: null, pageTitle: null, url,
+        note: `That tab is ${where} — this reads a LinkedIn profile, so open the person’s linkedin.com/in/… page and press this again.`,
+      }
+    }
+
+    const injections = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: grabPage })
+    const page = injections.map((i) => i.result as { html?: string; url?: string; title?: string } | null | undefined)
+      .find((p) => !!p && typeof p.html === 'string' && p.html.length > 0)
+    if (!page?.html) {
+      return { status: 'error', profile: null, pageTitle: null, url, note: 'Could not read that page — reload the profile and press this again.' }
+    }
+    const pageTitle = typeof page.title === 'string' && page.title ? page.title : null
+    const doc = new DOMParser().parseFromString(page.html, 'text/html')
+    const read = page.url ?? url
+
+    let parsed: Partial<LinkedInProfile> | null = null
+    try {
+      parsed = parse(doc, read)
+    } catch (e) {
+      // an adapter that threw must not lose the read: fall back and SAY so
+      const fallback = toProfile(readProfileDocument(doc, read), target.canonical, read)
+      return {
+        status: 'error', profile: fallback, pageTitle, url,
+        note: `The profile adapter failed (${e instanceof Error ? e.message : String(e)}) — only the page’s own structured data was read. Check the fields before saving.`,
+      }
+    }
+    const profile = toProfile(parsed, target.canonical, read)
+    if (!profile.fullName) {
+      return {
+        status: 'error', profile, pageTitle, url,
+        note: 'Read the page but found no name on it — scroll the profile to the top and press this again, or type the name in.',
+      }
+    }
+    return { status: 'sent', profile, pageTitle, url, note: `Read ${profile.fullName}${profile.company ? ` at ${profile.company}` : ''}.` }
+  } catch (e) {
+    return { status: 'error', profile: null, pageTitle: null, url, note: `Could not read the page — ${e instanceof Error ? e.message : String(e)}` }
+  }
+}
+
+// ---- the hub's outreach routes --------------------------------------------------------------
+//
+// Thin on purpose. The 20 templates, the fill, the ≤ 300 rule, the banned phrases and the
+// near-synonym check are apps/mapper/service/outreach.py's, and nothing here second-guesses them:
+// a rule lives in exactly one place, or it drifts.
+
+export interface OutreachTemplate {
+  key: string
+  bracket: string
+  gender: string
+  tone: OutreachTone
+  body: string
+  /** What the fixed prose costs, so the panel can show how much room the fills have. */
+  skeletonChars: number
+  tokens: string[]
+}
+
+/** One reason a message may not be sent as written, and what to do about it. Never an edit. */
+export interface OutreachReason {
+  code: string
+  detail: string
+  fix: string
+  over?: number
+}
+
+export interface OutreachDraft {
+  ok: boolean
+  templateKey: string | null
+  text: string
+  chars: number
+  max: number
+  skeletonChars?: number
+  reasons: OutreachReason[]
+}
+
+/** What /outreach/tighten answers. Not an OutreachDraft: a rewrite carries no template — it is the
+ *  shortened text plus what it cost, gated by the same checks a typed draft goes through. */
+export interface TightenResult {
+  ok: boolean
+  text: string
+  chars: number
+  max: number
+  reasons: OutreachReason[]
+  model: string
+  usage: { input: number | null; output: number | null }
+  costUsd: number
+}
+
+/** The five slots. `standoutSkill` is TYPED BY HAND — nothing in this file fills it. */
+export interface OutreachValues {
+  name?: string
+  standoutSkill?: string
+  company?: string
+  skillset?: string
+  targetRole?: string
+}
+
+export interface DraftRequest {
+  bracket: LeadAgeBracket | string
+  gender: LeadGender | string
+  tone: OutreachTone
+  values: OutreachValues
+  /** Text he edited by hand: gated exactly as it stands on screen, with no template applied. */
+  text?: string
+  templateKey?: string | null
+}
+
+export interface TemplatesOutcome extends OutreachOutcome {
+  templates: OutreachTemplate[]
+  max: number
+  tokens: string[]
+  banned: string[]
+}
+
+export interface DraftOutcome extends OutreachOutcome {
+  draft: OutreachDraft | null
+}
+
+export interface TightenOutcome extends OutreachOutcome {
+  /** Null whenever the rewrite did not happen — the caller still holds the original, untouched. */
+  result: TightenResult | null
+}
+
+type Call<T> = { ok: true; body: T } | { ok: false; note: string }
+
+async function call<T>(path: string, init: RequestInit = {}): Promise<Call<T>> {
+  let response: Response
+  try {
+    const { baseUrl, token } = await getTailorConfig()
+    assertAllowedTailorUrl(baseUrl)
+    response = await fetch(`${baseUrl}${path}`, {
+      ...init,
+      headers: { 'Content-Type': 'application/json', ...(token ? { 'X-Tailor-Token': token } : {}), ...(init.headers ?? {}) },
+    })
+  } catch {
+    // connection refused is the ordinary "the hub isn't running" case, not a stack trace
+    return { ok: false, note: 'The hub is not running — start it with `make serve` and try again.' }
+  }
+  if (response.status === 401) {
+    return { ok: false, note: 'The hub rejected the token — open Hub connection above and set it.' }
+  }
+  const raw = await response.text()
+  let payload: unknown = null
+  if (raw) {
+    try {
+      payload = JSON.parse(raw)
+    } catch {
+      return { ok: false, note: `The hub answered with something that is not JSON (HTTP ${response.status}).` }
+    }
+  }
+  if (!response.ok) {
+    const message = (payload as { error?: string } | null)?.error
+    return { ok: false, note: message ?? `The hub answered HTTP ${response.status}.` }
+  }
+  return { ok: true, body: payload as T }
+}
+
+/** The 20 connection notes, from data/outreach. Free, and read once when the panel opens. */
+export async function getTemplates(): Promise<TemplatesOutcome> {
+  const empty = { templates: [], max: 300, tokens: [] as string[], banned: [] as string[] }
+  const res = await call<{ templates?: OutreachTemplate[]; max?: number; tokens?: string[]; banned?: string[] }>('/outreach/templates')
+  if (!res.ok) return { status: 'error', note: `No templates — ${res.note}`, ...empty }
+  const templates = Array.isArray(res.body.templates) ? res.body.templates : []
+  if (templates.length === 0) {
+    return { status: 'error', note: 'The hub read no templates — check data/outreach/templates.MD and professional_templates.MD.', ...empty }
+  }
+  return {
+    status: 'sent', note: `${templates.length} templates.`, templates,
+    max: typeof res.body.max === 'number' ? res.body.max : 300,
+    tokens: Array.isArray(res.body.tokens) ? res.body.tokens : [],
+    banned: Array.isArray(res.body.banned) ? res.body.banned : [],
+  }
+}
+
+/**
+ * Fill a template (or gate the text he typed) and get the verdict back. Spends NOTHING, so the
+ * panel may call it on every keystroke. An over-length note comes back refused, with what to cut —
+ * and the panel offers Tighten beside that refusal (Bob, 2026-09-07: both, not either).
+ */
+export async function draftMessage(request: DraftRequest): Promise<DraftOutcome> {
+  const body: Record<string, unknown> = {
+    bracket: request.bracket, gender: request.gender, tone: request.tone, values: request.values,
+  }
+  if (request.text !== undefined) body.text = request.text
+  if (request.templateKey !== undefined) body.templateKey = request.templateKey
+  const res = await call<OutreachDraft>('/outreach/draft', { method: 'POST', body: JSON.stringify(body) })
+  if (!res.ok) return { status: 'error', note: `No draft — ${res.note}`, draft: null }
+  const draft = res.body
+  if (!draft || typeof draft.text !== 'string') {
+    return { status: 'error', note: 'The hub answered without a draft.', draft: null }
+  }
+  const reasons = Array.isArray(draft.reasons) ? draft.reasons : []
+  return {
+    status: 'sent', draft: { ...draft, reasons },
+    note: reasons.length === 0
+      ? `Ready — ${draft.chars} of ${draft.max} characters.`
+      : `Not ready: ${reasons.map((r) => r.fix).join('; ')}.`,
+  }
+}
+
+/**
+ * THE ONE CALL IN STAGE 8 THAT SPENDS, and only because the human pressed Tighten. It shortens an
+ * over-length note; it never returns the original as though it had been rewritten, and the caller
+ * keeps the original whatever happens here. The rewrite goes through the same gate as a typed
+ * draft, so a shortening that breaks a rule comes back refused rather than shipped.
+ */
+export async function tightenMessage(text: string, values: OutreachValues = {}): Promise<TightenOutcome> {
+  if (!text.trim()) return { status: 'error', note: 'Nothing to tighten yet.', result: null }
+  const res = await call<TightenResult>('/outreach/tighten', { method: 'POST', body: JSON.stringify({ text, values }) })
+  if (!res.ok) return { status: 'error', note: `Not tightened, the draft is unchanged — ${res.note}`, result: null }
+  const result = res.body
+  if (!result || typeof result.text !== 'string' || !result.text.trim()) {
+    return { status: 'error', note: 'The model returned nothing — the draft is unchanged.', result: null }
+  }
+  const reasons = Array.isArray(result.reasons) ? result.reasons : []
+  return {
+    status: 'sent', result: { ...result, reasons },
+    note: reasons.length === 0
+      ? `Tightened to ${result.chars} characters (${result.costUsd != null ? `$${result.costUsd}` : 'cost unreported'}).`
+      : `Tightened to ${result.chars} characters, still not ready: ${reasons.map((r) => r.fix).join('; ')}.`,
+  }
+}
+
+// ---- writing the outreach log ---------------------------------------------------------------
+
+export interface LeadFields {
+  /** Confirmed by the human; the profile's suggestion is only the starting value. */
+  ageBracket?: LeadAgeBracket
+  gender?: LeadGender
+  ageGenderConfirmed?: boolean
+  /** TYPED BY HAND. Nothing derives it. */
+  standoutSkill?: string
+  reachOutReason?: LeadReachOutReason
+  /** The posting that prompted the outreach — a reference to `jobs`, never a merge. */
+  jobId?: string
+  /** Only when the caller means to move it. Omitted by default: see saveLead. */
+  status?: LeadStatus
+}
+
+export interface LeadOutcome extends OutreachOutcome {
+  /** The hub's row id, when the row landed in this flush. Null when it is still queued. */
+  leadId: string | null
+  /** Exactly the columns that were sent. */
+  row: Record<string, unknown>
+}
+
+export interface SentMessage {
+  body: string
+  kind?: MessageKind
+  templateKey?: string | null
+  charCount?: number
+  /** When the human pressed the button. Defaults to now — which is the point. */
+  sentAt?: Date
+}
+
+export interface SentOutcome extends OutreachOutcome {
+  /** The stored `messages` row id, when it landed in this flush. */
+  messageId: string | null
+  /** What was sent, so the panel can show the row it wrote. */
+  row: Record<string, unknown>
+}
+
+const LEAD_COLUMNS = new Set<string>(ENTITY_COLUMNS.leads)
+const MESSAGE_COLUMNS = new Set<string>(ENTITY_COLUMNS.messages)
+
+/** Only the columns this writer actually knows: nothing null, nothing empty, nothing invented, and
+ *  nothing the entity contract does not have. PostgREST merges what it is sent, so a column left
+ *  out keeps whatever the stored row already holds — an omission is never an erasure. */
+function columnsKnown(draft: Record<string, unknown>, allowed: Set<string>): Record<string, unknown> {
+  const row: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(draft)) {
+    if (value === null || value === undefined || value === '') continue
+    if (!allowed.has(key)) continue
+    row[key] = value
+  }
+  return row
+}
+
+// One writer at a time. An enqueue that lands during another writer's in-flight flush would be
+// dropped by that flush's write-back and then reported as sent because it is in no list — the
+// hazard lib/job-capture.ts's recordChain exists for.
+let writeChain: Promise<unknown> = Promise.resolve()
+
+function enqueue<T>(work: () => Promise<T>): Promise<T> {
+  const run = writeChain.then(work, work)
+  writeChain = run.then(() => undefined, () => undefined)
+  return run
+}
+
+interface Settled {
+  status: OutreachStatus
+  row: Record<string, unknown> | null
+  note: string
+}
+
+/** What each enqueued ref came to. ONE flush for all of them, and every verdict read from that one
+ *  report: a second flush would find the outbox already empty and call a row that was written a
+ *  moment ago unanswered. */
+async function settle(refs: string[]): Promise<Settled[]> {
+  const report = await flushHubOutbox()
+  const dead = await getHubDeadLetters()
+  const outbox = await getHubOutbox()
+  return refs.map((ref) => {
+    const stored = report.rows?.[ref]
+    if (stored) return { status: 'sent' as const, row: stored, note: '' }
+    const died = dead.find((d) => d.ref === ref)
+    if (died) return { status: 'dead' as const, row: null, note: died.lastError ?? `HTTP ${died.status}` }
+    if (outbox.some((e) => e.ref === ref)) return { status: 'queued' as const, row: null, note: report.reason ?? 'not sent yet' }
+    return { status: 'error' as const, row: null, note: 'the hub gave no answer for this write' }
+  })
+}
+
+/**
+ * Upsert the person on (user_id, linkedin_url) — the hub's own default key for `leads`, so the
+ * same profile read from two tabs, or after an edit, is one row rather than two.
+ *
+ * `status` is deliberately NOT sent unless the caller asks for one. The upsert merges every column
+ * it is given, so a re-save of a lead already `messaged` would quietly walk it back to `captured`;
+ * omitting the column leaves the database default to do its job on insert and leaves the stored
+ * value alone on update. recordSent is the only thing here that moves a lead's status.
+ */
+export function saveLead(profile: LinkedInProfile, fields: LeadFields = {}): Promise<LeadOutcome> {
+  return enqueue(() => saveLeadNow(profile, fields))
+}
+
+async function saveLeadNow(profile: LinkedInProfile, fields: LeadFields): Promise<LeadOutcome> {
+  const key = profileUrl(profile.linkedinUrl)
+  if (!key) {
+    return { status: 'error', note: 'No LinkedIn profile URL on this person — read the profile page first.', leadId: null, row: {} }
+  }
+  const row = columnsKnown({
+    linkedin_url: key.canonical,
+    full_name: profile.fullName,
+    first_name: profile.firstName,
+    last_name: profile.lastName,
+    headline: profile.headline,
+    company: profile.company,
+    company_domain: profile.companyDomain,
+    role_title: profile.roleTitle,
+    location: profile.location,
+    background: profile.background,
+    // the suggestion is only a starting value; what is stored is what the human left on screen
+    age_bracket: fields.ageBracket ?? profile.suggestedBracket,
+    gender: fields.gender ?? profile.suggestedGender,
+    age_gender_confirmed: fields.ageGenderConfirmed === true ? true : undefined,
+    standout_skill: fields.standoutSkill,
+    reach_out_reason: fields.reachOutReason,
+    job_id: fields.jobId,
+    status: fields.status,
+  }, LEAD_COLUMNS)
+
+  try {
+    const ref = await hubUpsert('leads', row, undefined, { flush: false })
+    const [done] = await settle([ref])
+    const leadId = typeof done.row?.id === 'string' ? done.row.id : null
+    const who = profile.fullName ?? key.slug
+    if (done.status === 'sent') return { status: 'sent', note: `Lead saved (${who}).`, leadId, row }
+    if (done.status === 'dead') return { status: 'dead', note: `Lead refused by the hub — ${done.note}`, leadId: null, row }
+    if (done.status === 'queued') return { status: 'queued', note: `Lead queued for the hub — ${done.note}.`, leadId: null, row }
+    return { status: 'error', note: `Lead not saved — ${done.note}.`, leadId: null, row }
+  } catch (e) {
+    return { status: 'error', note: `Lead not saved — ${e instanceof Error ? e.message : String(e)}`, leadId: null, row }
+  }
+}
+
+/**
+ * The human pressed Send in LinkedIn, then pressed "I sent it". That button is the ONLY sent
+ * detection there is (Bob, 2026-09-07): nothing watches the page for a Connect → Pending change,
+ * nothing polls, and so `sent_detected_by` is always 'button'.
+ *
+ * Two writes in one batch, in this order: the `messages` row, then the lead's move to `messaged`.
+ */
+export function recordSent(leadId: string, message: SentMessage): Promise<SentOutcome> {
+  return enqueue(() => recordSentNow(leadId, message))
+}
+
+async function recordSentNow(leadId: string, message: SentMessage): Promise<SentOutcome> {
+  const body = (message.body ?? '').trim()
+  if (!leadId) {
+    return { status: 'error', note: 'No lead id yet — the lead row has not reached the hub, so the message has nothing to point at. Save the lead once the hub is back, then press this again.', messageId: null, row: {} }
+  }
+  if (!body) {
+    return { status: 'error', note: 'Nothing to log — the message is empty.', messageId: null, row: {} }
+  }
+
+  // THE POINT OF THIS STAGE. Writing `sent_at` on a messages row is what collects the email: the
+  // hub's _after_write (apps/mapper/service/hub.py) sees the first sent_at on a lead's messages and
+  // calls SalesQL by that lead's linkedin_url itself, once, ever. So this file calls NO enrichment
+  // route — not /enrich/lead, not /enrich/person, not now and not on a retry. A second trigger from
+  // here would be a second lookup, which is a second credit spent on a person we already looked up.
+  const row = columnsKnown({
+    lead_id: leadId,
+    kind: message.kind ?? 'connection_note',
+    template_key: message.templateKey,
+    body,
+    char_count: message.charCount ?? body.length,
+    sent_at: (message.sentAt ?? new Date()).toISOString(),
+    sent_detected_by: 'button',
+  }, MESSAGE_COLUMNS)
+
+  try {
+    const messageRef = await hubInsert('messages', row, { flush: false })
+    // second in the same batch, so the hub has already written the messages row (and fired the
+    // lookup) by the time the lead moves — and a patch of one column touches nothing else
+    const leadRef = await hubUpdate('leads', leadId, { status: 'messaged' }, { flush: false })
+    const [sent, lead] = await settle([messageRef, leadRef])
+    const messageId = typeof sent.row?.id === 'string' ? sent.row.id : null
+
+    if (sent.status === 'dead') {
+      return { status: 'dead', note: `Message not logged — refused by the hub — ${sent.note}`, messageId: null, row }
+    }
+    if (sent.status === 'queued') {
+      return { status: 'queued', note: `Message queued for the hub (${sent.note}) — the email lookup happens when it lands.`, messageId: null, row }
+    }
+    if (sent.status === 'error') {
+      return { status: 'error', note: `Message not logged — ${sent.note}.`, messageId: null, row }
+    }
+    if (lead.status !== 'sent') {
+      // the message IS logged and the lookup has fired; only the lead's own status lagged
+      return {
+        status: lead.status, messageId, row,
+        note: `Message logged as sent and the hub is collecting the email, but the lead is still marked as captured — ${lead.note}.`,
+      }
+    }
+    return { status: 'sent', note: 'Message logged as sent — the lead is messaged, and the hub is collecting the email.', messageId, row }
+  } catch (e) {
+    return { status: 'error', note: `Message not logged — ${e instanceof Error ? e.message : String(e)}`, messageId: null, row }
+  }
+}

@@ -1,0 +1,224 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { TailorMeasurement, TailorResult } from '@contract/types'
+import {
+  FinalizeRejectedError,
+  estimateCostUsd,
+  estimateRedraftCostUsd,
+  finalizeJob,
+  getTailorConfig,
+  listFamilies,
+  measureEdits,
+  setTailorConfig,
+} from '@/lib/tailor'
+import { buildEdits, counterText } from '@/ui/components/TailorTab'
+import { resetChromeMock } from './setup'
+
+// Plan 17 — the v6 engine behind the review page: engine/lens config, the
+// measure + families calls, the 422 refusal, and the pure helpers that turn
+// the fifteen boxes into the wire body and the counter under each box.
+
+function jsonResponse(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+}
+
+const draft: TailorResult = {
+  jobId: 'j1',
+  role: 'Quality Engineer',
+  engine: 'v6',
+  bullets: [
+    { slot: 1, category: 'MPI–McWane', text: 'Led root cause analysis on defects.', length: 'two_lines', maxChars: 215 },
+    { slot: 4, category: 'MPI–McWane', text: 'Tracked daily pipe counts.', length: 'one_line', maxChars: 108 },
+  ],
+  needsHumanReview: false,
+  costUsd: 0.2,
+  summary: 'Quality Engineer with 5+ years.',
+  skills: [{ category: 'Quality Systems:', skills: 'PFMEA, CAPA' }],
+  hiddenKeywords: 'Excel, scrap rate, cost of quality',
+}
+
+describe('tailor config: engine and lens', () => {
+  beforeEach(() => resetChromeMock())
+
+  it('defaults to the v6 engine with the router choosing the lens', async () => {
+    const c = await getTailorConfig()
+    expect(c.engine).toBe('v6')
+    expect(c.domain).toBe('')
+  })
+
+  it('persists the engine, lens and model preset next to the token', async () => {
+    await setTailorConfig({ token: 't', engine: 'v7', domain: '22', extractorModel: 'claude-sonnet-4-6' })
+    const c = await getTailorConfig()
+    expect(c).toMatchObject({ token: 't', engine: 'v7', domain: '22', mode: 'skills', writerModel: null, extractorModel: 'claude-sonnet-4-6' })
+    await setTailorConfig({ engine: 'v6', domain: '', extractorModel: null })
+    expect((await getTailorConfig()).engine).toBe('v6')
+  })
+
+  it('treats an unknown stored engine as v6 — and v5, which left the picker (Stage 5)', async () => {
+    await chrome.storage.local.set({ flashfiller_tailor_v1: { token: 'x', engine: 'v9' } })
+    expect((await getTailorConfig()).engine).toBe('v6')
+    await chrome.storage.local.set({ flashfiller_tailor_v1: { token: 'x', engine: 'v5', writerModel: 'gpt-9' } })
+    expect((await getTailorConfig())).toMatchObject({ engine: 'v6', writerModel: null })
+  })
+
+  it('estimates cost per engine and preset (the /batch page carries the same table)', () => {
+    expect(estimateCostUsd('v6')).toBeGreaterThan(estimateCostUsd('v5'))
+    expect(estimateCostUsd('v6')).toBe(0.22)
+    expect(estimateCostUsd('v6', { extractorModel: 'claude-haiku-4-5' })).toBe(0.15)
+    expect(estimateCostUsd('v6', { writerModel: 'claude-haiku-4-5', extractorModel: 'claude-haiku-4-5' })).toBe(0.09)
+    expect(estimateCostUsd('v7')).toBe(0.03)
+    expect(estimateCostUsd('v7', { extractorModel: 'claude-sonnet-4-6' })).toBe(0.09)
+    expect(estimateRedraftCostUsd()).toBeLessThan(estimateCostUsd('v6'))
+    expect(estimateRedraftCostUsd({ writerModel: 'claude-haiku-4-5' })).toBeLessThan(estimateRedraftCostUsd())
+  })
+})
+
+describe('service calls', () => {
+  const fetchMock = vi.fn()
+  beforeEach(async () => {
+    resetChromeMock()
+    await setTailorConfig({ token: 'tok' })
+    fetchMock.mockReset()
+    vi.stubGlobal('fetch', fetchMock)
+  })
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('measureEdits posts the edits to /measure with the token', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { ok: true, items: [], limits: null }))
+    const res = await measureEdits('j1', { bullets: [{ slot: 4, text: 'x' }] })
+    expect(res.ok).toBe(true)
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('http://127.0.0.1:8765/tailor/j1/measure')
+    expect(init.method).toBe('POST')
+    expect((init.headers as Record<string, string>)['X-Tailor-Token']).toBe('tok')
+    expect(JSON.parse(String(init.body))).toEqual({ bullets: [{ slot: 4, text: 'x' }] })
+  })
+
+  it('listFamilies reads /tailor/domains', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { families: [{ id: '22', slug: 'q', name: 'Quality', hasProfile: true }] }))
+    const fams = await listFamilies()
+    expect(fams).toHaveLength(1)
+    expect((fetchMock.mock.calls[0] as [string])[0]).toBe('http://127.0.0.1:8765/tailor/domains')
+  })
+
+  it('finalizeJob surfaces a 422 as FinalizeRejectedError with the violations', async () => {
+    const violation: TailorMeasurement = {
+      id: 'slot 4', kind: 'bullet', slot: 4, chars: 130, maxChars: 108, words: 20,
+      lines: 2, minLines: 1, maxLines: 1, ok: false, message: 'renders on 2 lines (limit 1)',
+    }
+    fetchMock.mockResolvedValue(jsonResponse(422, { error: '1 box over the line limits: slot 4', violations: [violation], limits: null }))
+    const err = await finalizeJob('j1', { bullets: [{ slot: 4, text: 'too long' }] }).catch((e) => e)
+    expect(err).toBeInstanceOf(FinalizeRejectedError)
+    expect((err as FinalizeRejectedError).violations).toEqual([violation])
+    expect((err as FinalizeRejectedError).message).toContain('slot 4')
+  })
+
+  it('other errors still surface as plain errors', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(409, { error: 'another finalize is already running — retry in a moment.' }))
+    await expect(finalizeJob('j1', {})).rejects.toThrow(/another finalize/)
+  })
+})
+
+describe('buildEdits — the fifteen boxes on the wire', () => {
+  it('sends only what changed when approving', () => {
+    const edits = buildEdits(draft, draft.summary!, draft.skills!, { 1: draft.bullets[0].text, 4: 'Tracked daily pipe counts as yield inputs.' },
+      draft.hiddenKeywords!, true)
+    expect(edits).toEqual({ bullets: [{ slot: 4, text: 'Tracked daily pipe counts as yield inputs.' }] })
+  })
+
+  it('sends every box when measuring', () => {
+    const edits = buildEdits(draft, draft.summary!, draft.skills!, {}, draft.hiddenKeywords!, false)
+    expect(edits.summary).toBe(draft.summary)
+    expect(edits.skills).toEqual([{ category: 'Quality Systems:', skills: 'PFMEA, CAPA' }])
+    expect(edits.bullets).toEqual([{ slot: 1, text: draft.bullets[0].text }, { slot: 4, text: draft.bullets[1].text }])
+    expect(edits.hiddenKeywords).toBe('Excel, scrap rate, cost of quality')
+  })
+
+  it('normalises the hidden block and sends an emptied box as an empty string', () => {
+    const pruned = buildEdits(draft, draft.summary!, draft.skills!, {}, ' Excel ,, scrap rate ', true)
+    expect(pruned.hiddenKeywords).toBe('Excel, scrap rate')
+    const emptied = buildEdits(draft, draft.summary!, draft.skills!, {}, '', true)
+    expect(emptied.hiddenKeywords).toBe('')
+    const untouched = buildEdits(draft, draft.summary!, draft.skills!, {}, draft.hiddenKeywords!, true)
+    expect(untouched.hiddenKeywords).toBeUndefined()
+  })
+
+  it('never sends hidden keywords for a v5 result', () => {
+    const v5 = { ...draft, engine: 'v5' as const }
+    expect(buildEdits(v5, v5.summary!, v5.skills!, {}, 'x', false).hiddenKeywords).toBeUndefined()
+  })
+
+  it('drops emptied skills lines and treats a reordered list as an edit', () => {
+    const edits = buildEdits(draft, draft.summary!, [{ category: 'Quality Systems:', skills: '' }, { category: 'Tools:', skills: 'Minitab' }], {},
+      draft.hiddenKeywords!, true)
+    expect(edits.skills).toEqual([{ category: 'Tools:', skills: 'Minitab' }])
+  })
+})
+
+describe('counterText', () => {
+  it('shows characters and the rule before a measurement arrives', () => {
+    expect(counterText(undefined, 120, 215, 'two lines')).toBe('120/215 chars · two lines')
+    expect(counterText(undefined, 12, null, 'one line')).toBe('12 chars · one line')
+  })
+
+  it('shows the measured verdict', () => {
+    const ok: TailorMeasurement = { id: 'slot 1', kind: 'bullet', chars: 120, maxChars: 215, words: 18, lines: 2, minLines: 1, maxLines: 2, ok: true }
+    expect(counterText(ok, 120, 215, 'two lines')).toBe('120/215 chars · 2 lines ✓')
+    const bad: TailorMeasurement = { ...ok, id: 'slot 4', lines: 2, maxLines: 1, ok: false, message: 'renders on 2 lines (limit 1)' }
+    expect(counterText(bad, 120, 108, 'one line')).toBe('120/108 chars · 2 lines — renders on 2 lines (limit 1)')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Run continuity (Plan 19): closing the popup must not "destroy" a generation.
+// The record + typed edits round-trip through chrome.storage; stale edits from
+// another job never leak; only "unknown job" clears a record, never offline.
+// ---------------------------------------------------------------------------
+import {
+  TailorOfflineError,
+  clearActiveRun,
+  clearDraftEdits,
+  getActiveRun,
+  getDraftEdits,
+  isUnknownJobError,
+  saveActiveRun,
+  saveDraftEdits,
+} from '@/lib/tailor'
+
+describe('run continuity: active-run record and draft edits', () => {
+  beforeEach(() => resetChromeMock())
+
+  it('round-trips the active run and clears it', async () => {
+    expect(await getActiveRun()).toBeNull()
+    await saveActiveRun({ jobId: '20260902-101010-ab12', role: 'Quality Engineer', company: 'Acme',
+      jdText: 'JD text '.repeat(50), engine: 'v6', domain: '22', startedAt: 1234 })
+    const rec = await getActiveRun()
+    expect(rec?.jobId).toBe('20260902-101010-ab12')
+    expect(rec?.jdText).toContain('JD text')
+    await clearActiveRun()
+    expect(await getActiveRun()).toBeNull()
+  })
+
+  it('a new run record replaces the old one', async () => {
+    await saveActiveRun({ jobId: 'a', role: 'IE', company: null, jdText: 'x', engine: 'v6', domain: '', startedAt: 1 })
+    await saveActiveRun({ jobId: 'b', role: 'PE', company: 'Beta', jdText: 'y', engine: 'v6', domain: '', startedAt: 2 })
+    expect((await getActiveRun())?.jobId).toBe('b')
+  })
+
+  it('draft edits come back only for their own job', async () => {
+    await saveDraftEdits({ jobId: 'j1', summary: 'Edited summary.', skills: [{ category: 'Tools:', skills: 'Minitab' }],
+      bullets: { 4: 'Shortened one-liner.' }, hidden: 'Excel, SPC', savedAt: 5 })
+    const mine = await getDraftEdits('j1')
+    expect(mine?.summary).toBe('Edited summary.')
+    expect(mine?.bullets[4]).toBe('Shortened one-liner.')
+    expect(await getDraftEdits('j2')).toBeNull()          // another job's boxes stay clean
+    await clearDraftEdits()
+    expect(await getDraftEdits('j1')).toBeNull()
+  })
+
+  it('only "unknown job" clears a record — offline and auth errors never do', () => {
+    expect(isUnknownJobError(new Error('unknown job id.'))).toBe(true)
+    expect(isUnknownJobError(new TailorOfflineError())).toBe(false)
+    expect(isUnknownJobError(new Error('Tailor rejected the token. Set it with "Set token" above.'))).toBe(false)
+    expect(isUnknownJobError('nope')).toBe(false)
+  })
+})

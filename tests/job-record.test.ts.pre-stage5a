@@ -1,0 +1,179 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { HubBatchRequest } from '@contract/types'
+import { getHubDeadLetters, getHubOutbox } from '@/lib/hub'
+import { recordActiveTabJob, recordFormJob, type GrabbedPage, type JobCapture } from '@/lib/job-capture'
+import { setTailorConfig } from '@/lib/tailor'
+import { resetChromeMock } from './setup'
+
+// Stage 4 part 2 — the Read this page press and the Preflight / Generate press,
+// end to end through the outbox: sent / queued / dead / refused / error, and the
+// row that reaches POST /db/batch.
+
+const LONG = 'Own daily production, run root cause analysis on casting defects, SPC on melt chemistry, coordinate NDT and CAPA, and drive first-pass yield across the foundry. '.repeat(3)
+const TAB_URL = 'https://www.linkedin.com/jobs/view/usa-process-engineer-at-walmart-4420761539/'
+const PAGE = `<html><head><title>(USA) Process Engineer | Walmart | LinkedIn</title></head><body>
+  <h1>(USA) Process Engineer</h1><a href="/company/walmart/">Walmart</a>
+  <div id="job-details"><p>${LONG}</p></div></body></html>`
+const SHELL = '<html><head><title>(USA) Process Engineer | Walmart | LinkedIn</title></head><body><h1>(USA) Process Engineer</h1><div id="job-details"><p>Loading…</p></div></body></html>'
+
+function jsonResponse(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+}
+
+function batchOk(req: HubBatchRequest): Response {
+  return jsonResponse(200, {
+    ok: true,
+    results: req.ops.map((op) => ({ clientRef: op.clientRef, ok: true, status: 200, row: { id: 'r-' + op.clientRef, ...(op.body ?? {}) }, error: null })),
+  })
+}
+
+function lastBatch(fetchMock: ReturnType<typeof vi.fn>): HubBatchRequest {
+  const call = fetchMock.mock.calls.at(-1) as [string, RequestInit]
+  expect(call[0]).toBe('http://127.0.0.1:8765/db/batch')
+  return JSON.parse(String(call[1].body)) as HubBatchRequest
+}
+
+const chromeMock = globalThis.chrome as unknown as Record<string, unknown>
+
+function installTab(url: string, pages: Array<Partial<GrabbedPage> & { frameId?: number }> | Error): void {
+  chromeMock.tabs = { query: async () => [{ id: 7, url }] }
+  chromeMock.scripting = {
+    executeScript: async () => {
+      if (pages instanceof Error) throw pages
+      return pages.map((p, i) => ({ frameId: p.frameId ?? i, result: { html: p.html ?? '', url: p.url ?? url, title: p.title ?? '', top: p.top ?? i === 0 } }))
+    },
+  }
+}
+
+describe('recording a posting through the outbox', () => {
+  const fetchMock = vi.fn()
+
+  beforeEach(async () => {
+    resetChromeMock()
+    fetchMock.mockReset()
+    vi.stubGlobal('fetch', fetchMock)
+    await setTailorConfig({ token: 'tok' })
+    installTab(TAB_URL, [{ html: PAGE, title: '(USA) Process Engineer | Walmart | LinkedIn' }])
+  })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    delete chromeMock.tabs
+    delete chromeMock.scripting
+  })
+
+  it('sent: one upsert on the mapper key, then the outbox is empty', async () => {
+    fetchMock.mockImplementation(async (_url: string, init: RequestInit) => batchOk(JSON.parse(String(init.body)) as HubBatchRequest))
+    const out = await recordActiveTabJob()
+    expect(out.status).toBe('sent')
+    expect(out.note).toMatch(/^Job saved \(linkedin, \d+\/12 fields\)\.$/)
+    expect(out.capture?.source).toBe('linkedin')
+    const batch = lastBatch(fetchMock)
+    expect(batch.surface).toBe('extension')
+    expect(batch.ops).toHaveLength(1)
+    expect(batch.ops[0]).toMatchObject({ op: 'upsert', table: 'jobs', onConflict: null })
+    expect(batch.ops[0].body).toMatchObject({
+      source: 'linkedin', ats: 'unknown', captured_by: 'extension', title: '(USA) Process Engineer', company: 'Walmart',
+      source_url: TAB_URL, dedupe_key: 'walmart|usa process engineer|li:4420761539',
+    })
+    expect(batch.ops[0].body).not.toHaveProperty('status')
+    expect(batch.ops[0].body).not.toHaveProperty('user_id')
+    expect(await getHubOutbox()).toEqual([])
+    expect(await getHubDeadLetters()).toEqual([])
+  })
+
+  it('queued: the hub is down, the row waits in the outbox, nothing is lost', async () => {
+    fetchMock.mockRejectedValue(new TypeError('connect ECONNREFUSED'))
+    const out = await recordActiveTabJob()
+    expect(out.status).toBe('queued')
+    expect(out.note).toMatch(/queued for the hub — Tailor service is not running/)
+    const outbox = await getHubOutbox()
+    expect(outbox).toHaveLength(1)
+    expect(outbox[0].ref).toBe(out.ref)
+    expect(outbox[0].op.body).toMatchObject({ dedupe_key: 'walmart|usa process engineer|li:4420761539' })
+  })
+
+  it('dead: the hub refused the row (4xx) — dead letter, not a retry, and the reason is in the note', async () => {
+    fetchMock.mockImplementation(async (_url: string, init: RequestInit) => {
+      const req = JSON.parse(String(init.body)) as HubBatchRequest
+      return jsonResponse(207, { ok: false, results: req.ops.map((op) => ({ clientRef: op.clientRef, ok: false, status: 400, row: null, error: 'jobs: source must be one of linkedin, ats_portal…' })) })
+    })
+    const out = await recordActiveTabJob()
+    expect(out.status).toBe('dead')
+    expect(out.note).toMatch(/refused by the hub — jobs: source must be/)
+    expect(await getHubOutbox()).toEqual([])
+    expect(await getHubDeadLetters()).toHaveLength(1)
+  })
+
+  it('refused: a page without a description records nothing and says why', async () => {
+    installTab(TAB_URL, [{ html: SHELL }])
+    const out = await recordActiveTabJob()
+    expect(out.status).toBe('refused')
+    expect(out.note).toMatch(/no job description found/)
+    expect(out.capture?.title).toBe('(USA) Process Engineer')
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(await getHubOutbox()).toEqual([])
+  })
+
+  it('error: no http tab, or the injection failing, never throws and enqueues nothing', async () => {
+    installTab('chrome://extensions', [{ html: PAGE }])
+    expect(await recordActiveTabJob()).toMatchObject({ status: 'error', note: 'Job not saved: Open the job posting in the active tab first.' })
+    installTab(TAB_URL, new Error('Cannot access contents of the page'))
+    expect(await recordActiveTabJob()).toMatchObject({ status: 'error', note: 'Job not saved: Cannot access contents of the page' })
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(await getHubOutbox()).toEqual([])
+  })
+
+  it('frames: the top frame is a shell, the posting is read from a content frame', async () => {
+    fetchMock.mockImplementation(async (_url: string, init: RequestInit) => batchOk(JSON.parse(String(init.body)) as HubBatchRequest))
+    installTab('https://careers-acme.icims.com/jobs/12345/process-engineer/job', [
+      { html: '<html><head><title>Job Details</title></head><body><iframe id="icims_content_iframe" src="x"></iframe></body></html>', title: 'Job Details' },
+      { frameId: 3, top: false, url: 'https://careers-acme.icims.com/jobs/12345/process-engineer/job?in_iframe=1',
+        html: `<html><body><div class="iCIMS_Header"><h1>Process Engineer</h1></div><div class="iCIMS_JobContent"><p>${LONG}</p></div></body></html>` },
+    ])
+    const out = await recordActiveTabJob()
+    expect(out.status).toBe('sent')
+    expect(lastBatch(fetchMock).ops[0].body).toMatchObject({ ats: 'icims', ats_req_id: '12345', title: 'Process Engineer', company: 'acme', dedupe_key: 'acme|process engineer|req:12345' })
+  })
+
+  it('the Tailor form without a page: a manual row keyed on the description', async () => {
+    fetchMock.mockImplementation(async (_url: string, init: RequestInit) => batchOk(JSON.parse(String(init.body)) as HubBatchRequest))
+    const out = await recordFormJob(null, { title: 'Manufacturing Engineer', company: 'Unknown', description: LONG })
+    expect(out).toMatchObject({ status: 'sent', note: 'Job saved (manual, 3/12 fields).' })
+    const body = lastBatch(fetchMock).ops[0].body as Record<string, unknown>
+    expect(body).toMatchObject({ source: 'manual', ats: 'unknown', captured_by: 'extension', dedupe_key: 'unknown|manufacturing engineer|desc:991fb0f9c7d2' })
+    expect(body).not.toHaveProperty('source_url')
+    expect((body.raw as Record<string, unknown>)._origin).toBe('tailor-form')
+  })
+
+  it('the Tailor form after a page read: the page keeps its identity (same key), the form edits ride in raw', async () => {
+    fetchMock.mockImplementation(async (_url: string, init: RequestInit) => batchOk(JSON.parse(String(init.body)) as HubBatchRequest))
+    const first = await recordActiveTabJob()
+    const capture = first.capture as JobCapture
+    const out = await recordFormJob(capture, { title: 'Process Engineer', company: 'Walmart Inc', description: LONG + ' Edited by hand.' })
+    expect(out.status).toBe('sent')
+    const body = lastBatch(fetchMock).ops[0].body as Record<string, unknown>
+    expect(body).toMatchObject({ source: 'linkedin', title: '(USA) Process Engineer', company: 'Walmart', source_url: TAB_URL, dedupe_key: 'walmart|usa process engineer|li:4420761539' })
+    expect(body.description).toContain('Edited by hand.')
+    const raw = body.raw as Record<string, unknown>
+    expect(raw._layers).toMatchObject({ description: 'form' })
+    expect(raw).toMatchObject({ _origin: 'tailor-form', _form_title: 'Process Engineer', _form_company: 'Walmart Inc' })
+  })
+
+  it('the Tailor form reused for another posting (a different JD) is a manual row, not the page row', async () => {
+    fetchMock.mockImplementation(async (_url: string, init: RequestInit) => batchOk(JSON.parse(String(init.body)) as HubBatchRequest))
+    const first = await recordActiveTabJob()
+    const other = 'A completely different posting about quality systems, supplier audits, PPAP and APQP in an automotive plant. '.repeat(3)
+    const out = await recordFormJob(first.capture as JobCapture, { title: 'Quality Engineer', company: 'Acme', description: other })
+    expect(out.status).toBe('sent')
+    const body = lastBatch(fetchMock).ops[0].body as Record<string, unknown>
+    expect(body).toMatchObject({ source: 'manual', title: 'Quality Engineer', company: 'Acme' })
+    expect(body).not.toHaveProperty('source_url')
+    expect(String(body.dedupe_key)).toMatch(/^acme\|quality engineer\|desc:/)
+  })
+
+  it('the Tailor form refuses without a company or a description, and says which', async () => {
+    expect(await recordFormJob(null, { title: 'IE', company: '', description: LONG })).toMatchObject({ status: 'refused', note: 'Job not saved: missing company.' })
+    expect(await recordFormJob(null, { title: 'IE', company: 'Acme', description: 'short' })).toMatchObject({ status: 'refused' })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+})

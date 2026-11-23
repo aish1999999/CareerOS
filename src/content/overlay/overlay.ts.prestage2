@@ -1,0 +1,383 @@
+// ---------------------------------------------------------------------------
+// On-page overlay (Section 12): floating badge, suggestion chips, unresolved-
+// variable prompts, capture prompts, filled-field highlights. Rendered inside
+// a shadow root so page CSS can't leak in either direction; must never
+// obstruct the site's submit button and is always dismissible.
+// ---------------------------------------------------------------------------
+
+const STYLE = `
+  :host { all: initial; }
+  * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  .ff-badge {
+    position: fixed; right: 16px; bottom: 16px; z-index: 2147483646;
+    display: flex; align-items: center; gap: 8px;
+    background: #1f1235; color: #fff; border-radius: 999px;
+    padding: 10px 14px; box-shadow: 0 4px 16px rgba(0,0,0,.25);
+    font-size: 13px; cursor: default; user-select: none;
+  }
+  .ff-badge button {
+    border: 0; border-radius: 999px; padding: 6px 12px; font-size: 13px;
+    background: #7c3aed; color: #fff; cursor: pointer; font-weight: 600;
+  }
+  .ff-badge button:hover { background: #8b5cf6; }
+  .ff-badge .ff-secondary {
+    background: transparent; border: 1px solid #7c3aed; color: #ddd6fe; font-weight: 500;
+  }
+  .ff-badge .ff-secondary:hover { background: rgba(124,58,237,.35); }
+  .ff-badge .ff-dimmed { opacity: .55; }
+  .ff-badge button:disabled { opacity: .55; cursor: default; }
+  .ff-badge button:disabled:hover { background: transparent; }
+  .ff-badge .ff-close {
+    background: transparent; padding: 2px 6px; font-size: 14px; color: #cbb9ee;
+  }
+  .ff-badge .ff-close:hover { background: rgba(255,255,255,.12); }
+  .ff-chip {
+    position: absolute; z-index: 2147483646;
+    background: #fff; border: 1px solid #ddd6fe; border-radius: 10px;
+    box-shadow: 0 4px 14px rgba(31,18,53,.18); padding: 8px 10px;
+    max-width: 340px; font-size: 12.5px; color: #1f2430;
+  }
+  .ff-chip .ff-value {
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    overflow: hidden; margin: 4px 0 6px; color: #4b5563; white-space: pre-wrap;
+  }
+  .ff-chip .ff-meta { color: #7c3aed; font-weight: 600; font-size: 11px; }
+  .ff-chip .ff-flag { color: #b45309; font-weight: 600; font-size: 11px; }
+  .ff-chip .ff-actions { display: flex; gap: 6px; }
+  .ff-chip .ff-actions button {
+    border: 1px solid #e5e7eb; background: #fff; border-radius: 7px;
+    padding: 4px 10px; font-size: 12px; cursor: pointer;
+  }
+  .ff-chip .ff-actions .ff-primary { background: #7c3aed; border-color: #7c3aed; color: #fff; font-weight: 600; }
+  .ff-chip .ff-actions .ff-primary:hover { background: #8b5cf6; }
+  .ff-chip input[type="text"] {
+    width: 100%; border: 1px solid #d1d5db; border-radius: 7px;
+    padding: 5px 8px; font-size: 12.5px; margin: 4px 0 6px;
+  }
+  .ff-toast {
+    position: fixed; right: 16px; bottom: 64px; z-index: 2147483646;
+    background: #1f2430; color: #fff; padding: 9px 14px; border-radius: 9px;
+    font-size: 12.5px; box-shadow: 0 4px 14px rgba(0,0,0,.25);
+  }
+`
+
+export interface ChipSpec {
+  fieldId: string
+  anchor: HTMLElement
+  title: string
+  value: string
+  /** e.g. "72% match", "needs review", "attach manually" */
+  meta: string
+  needsReview: boolean
+  kind: 'suggestion' | 'flag'
+}
+
+export interface OverlayCallbacks {
+  onAutofill(): void
+  onValidate(): void
+  onAiFill(): void
+  onAccept(fieldId: string): void
+  onSkip(fieldId: string): void
+  onDismiss(): void
+}
+
+/** AI Fill button state, re-derived from index.ts state on every badge
+ *  rebuild (setBadge wipes the DOM each scan — nothing may live only here). */
+export interface BadgeAiFill {
+  /** Eligible still-empty targets from the last validation report. */
+  count: number
+  /** Judge configured (Semantic matching + API key). Unconfigured renders
+   *  dimmed but CLICKABLE so the click can explain what's missing. */
+  enabled: boolean
+  busy: boolean
+}
+
+const HIGHLIGHT_STYLE = '2px solid #a78bfa'
+
+export class Overlay {
+  private host: HTMLElement
+  private root: ShadowRoot
+  private badge: HTMLElement | null = null
+  private chips = new Map<string, { el: HTMLElement; anchor: HTMLElement }>()
+  private highlighted = new Map<HTMLElement, string>()
+  private reposition = () => this.repositionChips()
+
+  constructor(private callbacks: OverlayCallbacks) {
+    this.host = document.createElement('div')
+    this.host.setAttribute('data-flashfiller', '')
+    this.root = this.host.attachShadow({ mode: 'closed' })
+    const style = document.createElement('style')
+    style.textContent = STYLE
+    this.root.appendChild(style)
+    document.documentElement.appendChild(this.host)
+    // capture: scroll events don't bubble, and ATS pages (Workday) scroll an
+    // INNER container — a plain window listener never fires there, leaving
+    // chips stranded at stale coordinates.
+    document.addEventListener('scroll', this.reposition, { capture: true, passive: true })
+    window.addEventListener('resize', this.reposition, { passive: true })
+  }
+
+  // ---- Badge ---------------------------------------------------------------
+
+  /** opts.explicit: user asked for this scan — render a zero-count result
+   *  visibly (no Autofill button) instead of showing nothing, so "no matches"
+   *  is distinguishable from "extension not running".
+   *  opts.aiFill: present once a validation report exists — it keeps the
+   *  badge alive at zero actionable fields (vanishing at the moment every
+   *  field filled would take Validate/AI Fill with it). */
+  setBadge(count: number, opts: { explicit?: boolean; aiFill?: BadgeAiFill | null } = {}): void {
+    const aiFill = opts.aiFill ?? null
+    if (count <= 0 && !opts.explicit && !aiFill) {
+      this.badge?.remove()
+      this.badge = null
+      return
+    }
+    if (!this.badge) {
+      this.badge = document.createElement('div')
+      this.badge.className = 'ff-badge'
+      this.root.appendChild(this.badge)
+    }
+    this.badge.innerHTML = ''
+    const label = document.createElement('span')
+    label.textContent =
+      count > 0
+        ? `⚡ ${count} fillable field${count === 1 ? '' : 's'}`
+        : aiFill
+          ? '⚡ 0 fillable fields left'
+          : '⚡ 0 fillable fields — nothing here matches your answers yet'
+    const close = document.createElement('button')
+    close.className = 'ff-close'
+    close.textContent = '✕'
+    close.title = 'Dismiss FlashFiller on this page'
+    close.addEventListener('click', () => {
+      this.callbacks.onDismiss()
+      this.destroy()
+    })
+    const parts: HTMLElement[] = [label]
+    if (count > 0) {
+      const fill = document.createElement('button')
+      fill.textContent = 'Autofill'
+      fill.addEventListener('click', () => this.callbacks.onAutofill())
+      parts.push(fill)
+    }
+    const validate = document.createElement('button')
+    validate.className = 'ff-secondary'
+    validate.textContent = 'Validate'
+    validate.title = 'Check what actually landed — filled vs still-empty fields'
+    validate.addEventListener('click', () => this.callbacks.onValidate())
+    parts.push(validate)
+    if (aiFill && (aiFill.count > 0 || aiFill.busy)) {
+      const ai = document.createElement('button')
+      ai.className = aiFill.enabled ? 'ff-secondary' : 'ff-secondary ff-dimmed'
+      ai.textContent = aiFill.busy ? 'AI Fill…' : `AI Fill (${aiFill.count})`
+      ai.title = aiFill.enabled
+        ? 'Fill the still-empty fields from the validation report via the OpenAI judge'
+        : 'Needs Semantic matching + API key (Options) — click for details'
+      // busy: disabled attr blocks the click; unconfigured stays CLICKABLE so
+      // index.ts can toast what's missing instead of a dead button.
+      if (aiFill.busy) ai.disabled = true
+      ai.addEventListener('click', () => this.callbacks.onAiFill())
+      parts.push(ai)
+    }
+    parts.push(close)
+    this.badge.append(...parts)
+  }
+
+  // ---- Chips ----------------------------------------------------------------
+
+  private positionChip(chip: HTMLElement, anchor: HTMLElement): void {
+    const rect = anchor.getBoundingClientRect()
+    chip.style.left = `${Math.max(8, rect.left + window.scrollX)}px`
+    chip.style.top = `${rect.bottom + window.scrollY + 4}px`
+  }
+
+  private repositionChips(): void {
+    // jsdom reports every rect as 0×0 — only treat zero-size anchors as
+    // hidden where layout actually exists (the root element has a size).
+    const layoutExists = document.documentElement.getBoundingClientRect().width > 0
+    for (const [id, { el, anchor }] of this.chips) {
+      if (!anchor.isConnected) {
+        // Field is gone (wizard step navigation) — the chip must go with it
+        el.remove()
+        this.chips.delete(id)
+        continue
+      }
+      const rect = anchor.getBoundingClientRect()
+      // Anchor still in the DOM but not rendered (hidden step): hide, don't
+      // strand the chip at a meaningless corner position.
+      const anchorInvisible = layoutExists && rect.width === 0 && rect.height === 0
+      el.style.display = anchorInvisible ? 'none' : ''
+      if (!anchorInvisible) this.positionChip(el, anchor)
+    }
+  }
+
+  /** Re-anchor/prune all chips — called after every rescan. */
+  refresh(): void {
+    this.repositionChips()
+  }
+
+  showChip(spec: ChipSpec): void {
+    this.removeChip(spec.fieldId)
+    const chip = document.createElement('div')
+    chip.className = 'ff-chip'
+
+    const meta = document.createElement('div')
+    meta.className = spec.kind === 'flag' ? 'ff-flag' : 'ff-meta'
+    meta.textContent = spec.needsReview ? `${spec.meta} · needs review` : spec.meta
+    chip.appendChild(meta)
+
+    if (spec.value) {
+      const value = document.createElement('div')
+      value.className = 'ff-value'
+      value.textContent = spec.value
+      chip.appendChild(value)
+    }
+
+    const actions = document.createElement('div')
+    actions.className = 'ff-actions'
+    if (spec.kind === 'suggestion') {
+      const accept = document.createElement('button')
+      accept.className = 'ff-primary'
+      accept.textContent = 'Accept'
+      accept.addEventListener('click', () => this.callbacks.onAccept(spec.fieldId))
+      const skip = document.createElement('button')
+      skip.textContent = 'Skip'
+      skip.addEventListener('click', () => this.callbacks.onSkip(spec.fieldId))
+      actions.append(accept, skip)
+    } else {
+      const ok = document.createElement('button')
+      ok.textContent = 'Got it'
+      ok.addEventListener('click', () => this.removeChip(spec.fieldId))
+      actions.append(ok)
+    }
+    chip.appendChild(actions)
+
+    this.root.appendChild(chip)
+    this.positionChip(chip, spec.anchor)
+    this.chips.set(spec.fieldId, { el: chip, anchor: spec.anchor })
+  }
+
+  removeChip(fieldId: string): void {
+    this.chips.get(fieldId)?.el.remove()
+    this.chips.delete(fieldId)
+  }
+
+  clearChips(): void {
+    for (const { el } of this.chips.values()) el.remove()
+    this.chips.clear()
+  }
+
+  // ---- Unresolved-variable prompt (Section 7) --------------------------------
+
+  promptVariable(name: string, anchor: HTMLElement, onSubmit: (value: string) => void): void {
+    const id = `var:${name}`
+    this.removeChip(id)
+    const chip = document.createElement('div')
+    chip.className = 'ff-chip'
+    const meta = document.createElement('div')
+    meta.className = 'ff-meta'
+    meta.textContent = `FlashFiller needs a value for {{${name}}}`
+    const input = document.createElement('input')
+    input.type = 'text'
+    input.placeholder = name === 'company' ? 'e.g. Acme Corp' : `Value for ${name}`
+    const actions = document.createElement('div')
+    actions.className = 'ff-actions'
+    const apply = document.createElement('button')
+    apply.className = 'ff-primary'
+    apply.textContent = 'Apply'
+    const submit = () => {
+      if (!input.value.trim()) return
+      this.removeChip(id)
+      onSubmit(input.value.trim())
+    }
+    apply.addEventListener('click', submit)
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submit()
+    })
+    const cancel = document.createElement('button')
+    cancel.textContent = 'Cancel'
+    cancel.addEventListener('click', () => this.removeChip(id))
+    actions.append(apply, cancel)
+    chip.append(meta, input, actions)
+    this.root.appendChild(chip)
+    this.positionChip(chip, anchor)
+    this.chips.set(id, { el: chip, anchor })
+    input.focus()
+  }
+
+  // ---- Capture prompt (Section 11) --------------------------------------------
+
+  showCapturePrompt(
+    anchor: HTMLElement,
+    question: string,
+    similarQuestion: string | null,
+    onChoice: (choice: 'new' | 'merge' | 'dismiss') => void,
+  ): void {
+    const id = 'capture'
+    this.removeChip(id)
+    const chip = document.createElement('div')
+    chip.className = 'ff-chip'
+    const meta = document.createElement('div')
+    meta.className = 'ff-meta'
+    meta.textContent = 'Save for review? It suggests (never auto-fills) until you approve it in the Review tab.'
+    const value = document.createElement('div')
+    value.className = 'ff-value'
+    value.textContent = question
+    const actions = document.createElement('div')
+    actions.className = 'ff-actions'
+
+    const done = (choice: 'new' | 'merge' | 'dismiss') => {
+      this.removeChip(id)
+      onChoice(choice)
+    }
+    const save = document.createElement('button')
+    save.className = 'ff-primary'
+    save.textContent = similarQuestion ? 'Save as new' : 'Save'
+    save.addEventListener('click', () => done('new'))
+    actions.appendChild(save)
+    if (similarQuestion) {
+      const merge = document.createElement('button')
+      merge.textContent = `Update "${similarQuestion.slice(0, 32)}"`
+      merge.title = `Add as alias of: ${similarQuestion}`
+      merge.addEventListener('click', () => done('merge'))
+      actions.appendChild(merge)
+    }
+    const no = document.createElement('button')
+    no.textContent = 'No thanks'
+    no.addEventListener('click', () => done('dismiss'))
+    actions.appendChild(no)
+
+    chip.append(meta, value, actions)
+    this.root.appendChild(chip)
+    this.positionChip(chip, anchor)
+    this.chips.set(id, { el: chip, anchor })
+  }
+
+  // ---- Filled-field highlight ---------------------------------------------------
+
+  highlightFilled(el: HTMLElement): void {
+    if (!this.highlighted.has(el)) {
+      this.highlighted.set(el, el.style.outline)
+      el.style.outline = HIGHLIGHT_STYLE
+      el.style.outlineOffset = '1px'
+    }
+  }
+
+  toast(message: string, ms = 3500): void {
+    const toast = document.createElement('div')
+    toast.className = 'ff-toast'
+    toast.textContent = message
+    this.root.appendChild(toast)
+    setTimeout(() => toast.remove(), ms)
+  }
+
+  destroy(): void {
+    for (const [el, original] of this.highlighted) el.style.outline = original
+    this.highlighted.clear()
+    // must mirror the ADD: scroll was registered on document with capture —
+    // a window/no-capture remove silently leaks the listener past dismiss
+    document.removeEventListener('scroll', this.reposition, { capture: true })
+    window.removeEventListener('resize', this.reposition)
+    this.host.remove()
+  }
+}

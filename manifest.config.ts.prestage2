@@ -1,0 +1,54 @@
+import { defineManifest } from '@crxjs/vite-plugin'
+
+/**
+ * The content script loads on every http(s) page but stays DORMANT — no
+ * observers, no scanning — unless the site is in settings.enabledDomains
+ * (major ATSes ship enabled by default; the popup's "Always run on this
+ * site" toggle adds any other career site) or the user asks for a one-off
+ * scan from the popup. Loading everywhere trades Chrome's install-time
+ * "all sites" warning for zero per-site friction; all data stays local
+ * regardless. Note: broadening host permissions on a published extension
+ * disables it until users re-approve — irrelevant while loaded unpacked.
+ */
+const ALL_SITES = ['https://*/*', 'http://*/*']
+
+export default defineManifest({
+  manifest_version: 3,
+  // Pins the extension ID; private key lives in key.pem.
+  key: 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAz3iT9YrREa1nXqpcRvvAtDaydnHM14j3ABj1Ug6jYpMV2T21FOzWm6+3PjqKvY8E3FrOYn3hR6/cpfVByQZDOIH+uWTVTqbX53sk7lEczsb9uVWWr/aZGojSBkxwS3N9EcRJGb73+oKbPZjMHZ/uaW8L3txNJmHboD10asuPt01rgkTtjS3d/+8pG1QZqIPysP/FHbdIyyTJ4hzL3MDDxjKhXz2dyRrDQSjYBoXdxmbNkN6bfgNNhVGWcuLhKtE2WIh0uelCD6bIS3NIibR4UjPFSHlnO7zp01ScHHkNFw/AJnRmy5HgynBhMCED9ooSVd2O6Y1hD/HUpi1jBXN5twIDAQAB',
+  name: 'FlashFiller',
+  version: '0.7.0',
+  description:
+    'Retrieval-based autofill for job applications. Train it with your answers once; it fills matching fields locally. Never auto-submits; data stays on your machine unless you opt into the OpenAI semantic judge.',
+  // 'debugger' powers the trusted-input fallback tier: when a widget ignores
+  // synthetic events, the service worker attaches CDP to the tab and sends a
+  // REAL (isTrusted) click — the same machinery Playwright uses. Chrome shows
+  // a "started debugging" infobar while attached; we detach seconds after use.
+  // 'unlimitedStorage': stored documents (resume feature) are base64 PDFs
+  // that would blow the 10MB chrome.storage.local quota fast.
+  permissions: ['storage', 'unlimitedStorage', 'activeTab', 'scripting', 'debugger'],
+  host_permissions: ALL_SITES,
+  action: {
+    default_popup: 'src/ui/popup/index.html',
+    default_title: 'FlashFiller',
+  },
+  options_page: 'src/ui/options/index.html',
+  background: {
+    service_worker: 'src/background/service-worker.ts',
+    type: 'module',
+  },
+  content_scripts: [
+    {
+      matches: ALL_SITES,
+      js: ['src/content/index.ts'],
+      all_frames: true,
+      run_at: 'document_idle',
+    },
+  ],
+  web_accessible_resources: [
+    {
+      resources: ['seed-questions.json'],
+      matches: ['<all_urls>'],
+    },
+  ],
+})

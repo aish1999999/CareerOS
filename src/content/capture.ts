@@ -1,0 +1,598 @@
+import type { PageContext, Profile, QAEntry, SignalBundle } from '@/types'
+import { lexicalScore } from '@/lib/scorers/lexical'
+import { canonical, normalize, tokenizeAnswer } from '@/lib/normalize'
+import { looksEeoLoose } from '@/lib/eeo'
+import { parseDateParts } from '@/lib/dates'
+import { newId } from '@/lib/storage'
+import { DEFAULT_ENABLED_DOMAINS } from '@/lib/schema'
+import { hostMatchesDomain } from '@/lib/domains'
+import { detectVariables } from '@/content/variables'
+
+// ---------------------------------------------------------------------------
+// Capture / learn loop (Section 11) — pure logic; DOM wiring lives in the
+// content bootstrap. When the user manually fills a field the matcher didn't
+// recognize, we offer to save it. Saved entries land as needs_review
+// (2026-07-16 rebuild, superseding the 2026-07-14 no-gate decision):
+// they suggest — never silently autofill — until approved in the Review tab
+// or via a suggestion-chip Accept. prepareCaptureValue cleans/normalizes the
+// value first (dates → ISO, placeholder noise skipped, branded answers
+// site-scoped) so what gets stored can actually round-trip at fill time.
+// ---------------------------------------------------------------------------
+
+export interface SimilarEntry {
+  entry: QAEntry
+  score: number
+}
+
+// ---- Page branding -----------------------------------------------------------
+// "companyname.com" under a "How did you hear about us? → Website" prompt is
+// page branding, not a genuinely different answer. These helpers recognize it
+// from the page context's company and the hostname's company label
+// (mcwane.wd5.myworkdayjobs.com → "mcwane").
+
+const GENERIC_HOST_LABELS = new Set([
+  'www', 'jobs', 'careers', 'career', 'apply', 'recruiting', 'boards', 'job-boards', 'talent',
+])
+
+/** Tokens that identify THIS company on THIS page. */
+export function brandTokens(context: PageContext | null | undefined, hostname = ''): Set<string> {
+  const brand = new Set<string>()
+  for (const t of tokenizeAnswer(context?.company ?? '')) brand.add(t)
+  const lower = hostname.toLowerCase()
+  // On a known ATS platform the tenant is the FIRST label and everything
+  // right of it is the platform (mcwane.wd5.myworkdayjobs.com → "mcwane";
+  // jobs.lever.co must yield nothing, never "lever"). On unknown domains —
+  // the company's own site, incl. vanity ATS deployments — walk past generic
+  // prefixes to the brand: careers.honeywell.com → "honeywell".
+  const onAtsPlatform = DEFAULT_ENABLED_DOMAINS.some((d) => hostMatchesDomain(lower, d))
+  const labels = onAtsPlatform ? lower.split('.').slice(0, 1) : lower.split('.').slice(0, -1)
+  const hostLabel = labels.find((l) => l && !GENERIC_HOST_LABELS.has(l)) ?? ''
+  if (hostLabel) {
+    brand.add(hostLabel)
+    for (const t of tokenizeAnswer(hostLabel)) brand.add(t)
+  }
+  return brand
+}
+
+const isBrandToken = (t: string, brand: Set<string>): boolean =>
+  t.length > 2 && t !== 'com' && brand.has(t)
+
+/** True when a manually-picked value differs from the stored answer only by
+ *  page branding — merging it must NOT demote an approved entry back to
+ *  needs_review, or every new company would flip it again (Section 11). */
+export function isContextBranded(
+  value: string,
+  context: PageContext | null | undefined,
+  hostname = '',
+): boolean {
+  const brand = brandTokens(context, hostname)
+  if (brand.size === 0) return false
+  return tokenizeAnswer(value).some((t) => isBrandToken(t, brand))
+}
+
+/** Index of the option carrying this page's branding, if any ("mcwane.com",
+ *  "McWane Careers Site"); ties broken by most overlapping tokens. */
+export function brandedOptionIndex(optionTexts: string[], brand: Set<string>): number | undefined {
+  if (brand.size === 0) return undefined
+  let best: number | undefined
+  let bestOverlap = 0
+  optionTexts.forEach((text, index) => {
+    const overlap = tokenizeAnswer(text).filter((t) => isBrandToken(t, brand)).length
+    if (overlap > bestOverlap) {
+      bestOverlap = overlap
+      best = index
+    }
+  })
+  return best
+}
+
+const SIMILAR_THRESHOLD = 0.8
+
+/** Find an existing Q&A entry this question likely duplicates (Section 11.3). */
+export function findSimilar(qa: QAEntry[], questionText: string): SimilarEntry | null {
+  let best: SimilarEntry | null = null
+  for (const entry of qa) {
+    for (const text of [entry.question, ...entry.aliases]) {
+      const score = lexicalScore(text, questionText)
+      if (score >= SIMILAR_THRESHOLD && (!best || score > best.score)) best = { entry, score }
+    }
+  }
+  return best
+}
+
+/** Union of two option-text lists, case-insensitively deduped, first-seen
+ *  casing wins. */
+export function mergeOptions(a: string[], b: string[]): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const text of [...a, ...b]) {
+    const key = text.trim().toLowerCase()
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    out.push(text.trim())
+  }
+  return out
+}
+
+/** Aliases for a fresh entry: raw label/placeholder plus the label cascade's
+ *  runner-up candidates — free cross-site matching material. */
+function captureAliases(signal: SignalBundle): string[] {
+  const rawLabel = signal.label || signal.placeholder
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const text of [rawLabel, ...(signal.labelAliases ?? [])]) {
+    const t = text?.trim()
+    // The exact stored question needs no alias; different CASING does help
+    // (the raw label keeps capitalization the canonical key lost).
+    if (!t || t === signal.normalizedQuestion || seen.has(t.toLowerCase())) continue
+    seen.add(t.toLowerCase())
+    out.push(t)
+  }
+  return out
+}
+
+/** Build the quarantined draft entry for a manually-filled field. Option-
+ *  bearing fields (select/radio/checkbox/custom-dropdown) record the full
+ *  option list so the Options tab can classify equivalent wordings later.
+ *  status is needs_review: learned answers suggest until approved
+ *  (2026-07-16 rebuild). */
+export function buildCaptureDraft(
+  signal: SignalBundle,
+  value: string,
+  context: PageContext,
+  now: number = Date.now(),
+  extras: { siteScope?: string | null; reviewNote?: string; question?: string } = {},
+): QAEntry {
+  return {
+    id: newId(),
+    question: extras.question ?? signal.normalizedQuestion,
+    aliases: captureAliases(signal),
+    answer: value,
+    answerType: 'text',
+    answerTemplate: null,
+    mapsTo: null,
+    variables: detectVariables(value),
+    personas: [],
+    tags: ['captured'],
+    fieldType: signal.kind,
+    options: mergeOptions(signal.options.map((o) => o.text), []),
+    status: 'needs_review', // suggest-only until approved (review gate)
+    source: 'captured',
+    captureContext: context, // powers "generalize" in the Review tab
+    siteScope: extras.siteScope ?? null,
+    reviewNote: extras.reviewNote ?? `Captured — approve to autofill on exact wording`,
+    lastWrongAt: null,
+    okCount: 0,
+    wrongCount: 0,
+    createdAt: now,
+    updatedAt: now,
+  }
+}
+
+/** Entry for an answer the semantic judge produced and a fill VERIFIED.
+ *  Pending like captures (2026-07-16): the in-session fill is untouched, but
+ *  REUSE on later sites waits for approval. The drift judge still aliases
+ *  pending entries (distill-while-gated), so approval day inherits every
+ *  wording seen meanwhile. */
+export function buildInferredEntry(
+  signal: SignalBundle,
+  answer: string,
+  context: PageContext,
+  now: number = Date.now(),
+): QAEntry {
+  // Inferred entries take the same key hygiene as captures; an uncleanable
+  // key falls back to the normalized question (the entry is review-gated).
+  const cleaned = cleanCaptureQuestion(signal)
+  return {
+    id: newId(),
+    question: isSkippedCapture(cleaned) ? signal.normalizedQuestion : cleaned.question,
+    aliases: captureAliases(signal),
+    answer,
+    answerType: 'text',
+    answerTemplate: null,
+    mapsTo: null,
+    variables: detectVariables(answer),
+    personas: [],
+    tags: ['ai-inferred'],
+    fieldType: signal.kind,
+    options: mergeOptions(signal.options.map((o) => o.text), []),
+    status: 'needs_review',
+    source: 'inferred',
+    captureContext: context,
+    siteScope: null,
+    reviewNote: 'AI-inferred and verified on one site — approve to reuse elsewhere',
+    lastWrongAt: null,
+    okCount: 0,
+    wrongCount: 0,
+    createdAt: now,
+    updatedAt: now,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Capture-value preparation (2026-07-16 rebuild): clean/normalize a manually
+// entered value BEFORE it becomes a stored answer, so what we learn can
+// round-trip through the fill pipeline on the next site. Pure; the content
+// bootstrap calls it with the page's hostname and the live profile.
+// ---------------------------------------------------------------------------
+
+export interface PreparedCapture {
+  value: string
+  siteScope: string | null
+  note: string
+  /** Cleaned question key to store (Stage 1 hygiene): questionnaire numbering
+   *  stripped, option-text contamination removed. Callers use this instead of
+   *  signal.normalizedQuestion when building/merging entries. */
+  question: string
+}
+
+export interface SkippedCapture {
+  skip: string
+}
+
+export function isSkippedCapture<T extends object>(p: T | SkippedCapture): p is SkippedCapture {
+  return 'skip' in p
+}
+
+/** "Select One"-style text and multi-select counters — never real answers. */
+const VALUE_PLACEHOLDER_RE =
+  /^\s*(please\s+)?(select|choose|pick)\b[\w\s()/.…-]*$|^\s*required\s*$|^\s*-+\s*$|^\s*—+\s*$|^\s*\.{3}\s*$/i
+const SELECTED_COUNT_RE = /^\s*\d+\s+(items?\s+)?selected\s*$/i
+
+/** 24+ chars of pure hex, or a UUID: an internal widget/option id. */
+const OPAQUE_ID_VALUE_RE =
+  /^(?:[0-9a-f]{24,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i
+
+// ---- Question-key hygiene (Stage 1, 2026-08-22) ------------------------------
+// The live store accumulated keys that can never match another site's wording
+// and one that smuggled an EEO answer past the gate:
+//   "genderdecline answerfemalemale"  — option texts mashed into the label
+//   "4 how long work material manager" — questionnaire numbering kept
+//   "select" / "apply" / "complet"     — bare widget words as whole questions
+// cleanCaptureQuestion() is the code-owned gate between a resolved label and a
+// stored question key.
+
+/** Bare widget/UI words that can never BE a question on their own. */
+const JUNK_KEY_WORDS = new Set([
+  'select', 'choose', 'pick', 'apply', 'submit', 'continue', 'next', 'back',
+  'search', 'open', 'close', 'edit', 'add', 'remove', 'browse', 'upload',
+  'complete', 'complet', 'done', 'ok', 'yes', 'no', 'save', 'cancel', 'clear',
+])
+
+const LEADING_NUMBERING_RE = /^\s*\d{1,3}\s*[.):\-–]?\s+/
+
+export interface CleanedQuestion {
+  question: string
+  /** Human-readable trail of what hygiene did (debug breadcrumbs). */
+  fixes: string[]
+}
+
+/**
+ * Clean a capture's question key, or refuse it. Deterministic, in order:
+ *  1. Strip questionnaire numbering ("4 how long…" → "how long…").
+ *  2. Strip option-text contamination: when ≥2 of the field's own option
+ *     texts appear verbatim inside the raw label (composed triggers render
+ *     "‹Label›‹Opt1›‹Opt2›…"), remove every option text and keep the
+ *     remainder as the label ("GenderDecline to answerFemaleMale" → "Gender").
+ *  3. Refuse bare widget words ("select", "apply") and keys that cleaning
+ *     left too short — an unmatchable key learns nothing and can only
+ *     mis-match later.
+ */
+export function cleanCaptureQuestion(
+  signal: Pick<SignalBundle, 'normalizedQuestion' | 'label'> & {
+    options?: { text: string }[]
+  },
+): CleanedQuestion | SkippedCapture {
+  const fixes: string[] = []
+  let label = (signal.label || signal.normalizedQuestion || '').trim()
+
+  const optionTexts = (signal.options ?? [])
+    .map((o) => o.text.trim())
+    .filter((t) => t.length >= 2)
+  if (optionTexts.length >= 2) {
+    const present = optionTexts.filter((t) => label.toLowerCase().includes(t.toLowerCase()))
+    if (present.length >= 2) {
+      let stripped = label
+      for (const t of present) {
+        const i = stripped.toLowerCase().indexOf(t.toLowerCase())
+        if (i !== -1) stripped = `${stripped.slice(0, i)} ${stripped.slice(i + t.length)}`
+      }
+      stripped = stripped.replace(/\s+/g, ' ').trim()
+      if (stripped.length >= 3) {
+        fixes.push(`stripped ${present.length} option texts from label`)
+        label = stripped
+      } else {
+        return { skip: 'label is only its own option texts — no real question' }
+      }
+    }
+  }
+
+  if (LEADING_NUMBERING_RE.test(label)) {
+    label = label.replace(LEADING_NUMBERING_RE, '').trim()
+    fixes.push('stripped questionnaire numbering')
+  }
+
+  // No fixes applied → keep the detector's established key byte-for-byte
+  // (normalizedQuestion); re-canonicalizing an untouched label could drift
+  // from the key format every existing entry already uses.
+  let question =
+    fixes.length === 0
+      ? (signal.normalizedQuestion || canonical(label) || normalize(label)).trim()
+      : canonical(label) || normalize(label)
+  question = question.replace(LEADING_NUMBERING_RE, '').trim()
+  if (!question) return { skip: 'empty question after cleaning' }
+  const words = question.split(/\s+/)
+  if (words.length === 1 && JUNK_KEY_WORDS.has(words[0]))
+    return { skip: `bare widget word "${question}" is not a question` }
+  if (question.length < 3) return { skip: `question key "${question}" too short to ever match` }
+  return { question, fixes }
+}
+
+/** Question labels that read as dates ("Start date", "Available from month"). */
+const DATE_CUE_RE = /\b(date|month|year)\b/i
+
+/** Every (year, month[, day]) the profile already knows — used to
+ *  disambiguate DD/MM vs MM/DD captures. */
+function profileDateParts(profile: Profile | undefined): { year: string; month: string; day?: string }[] {
+  if (!profile) return []
+  const out: { year: string; month: string; day?: string }[] = []
+  const push = (value: string) => {
+    const parts = parseDateParts(value)
+    if (parts) out.push({ year: parts.year, month: parts.month, day: parts.day })
+  }
+  for (const w of profile.workHistory) {
+    if (w.startDate) push(w.startDate)
+    if (w.endDate) push(w.endDate)
+  }
+  for (const e of profile.education) {
+    if (e.startDate) push(e.startDate)
+    if (e.endDate) push(e.endDate)
+  }
+  if (profile.earliestStartDate) push(profile.earliestStartDate)
+  return out
+}
+
+/** Canonicalize a date-looking capture to ISO ("YYYY-MM-DD" / "YYYY-MM").
+ *  Handles DD/MM entries (first component > 12 → swapped); truly ambiguous
+ *  slash dates (both components ≤ 12, differing) are resolved against dates
+ *  the profile already knows, else declined — a mis-parsed month is worse
+ *  than not learning. Returns null when `raw` isn't date-shaped at all. */
+export function canonicalizeDateCapture(
+  raw: string,
+  profile?: Profile,
+): { value: string } | { ambiguous: true } | null {
+  const trimmed = raw.trim()
+  const slash = trimmed.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/)
+  if (slash) {
+    const a = parseInt(slash[1], 10)
+    const b = parseInt(slash[2], 10)
+    const year = slash[3]
+    const iso = (m: number, d: number) =>
+      `${year}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+    if (a > 12 && b <= 12) return { value: iso(b, a) } // DD/MM typed
+    if (a <= 12 && b > 12) return { value: iso(a, b) } // MM/DD
+    if (a > 12 && b > 12) return null // not a date
+    if (a === b) return { value: iso(a, b) }
+    // Both readings plausible — does the profile already know one of them?
+    const known = profileDateParts(profile)
+    const mmdd = known.some((k) => k.year === year && k.month === String(a).padStart(2, '0'))
+    const ddmm = known.some((k) => k.year === year && k.month === String(b).padStart(2, '0'))
+    if (mmdd && !ddmm) return { value: iso(a, b) }
+    if (ddmm && !mmdd) return { value: iso(b, a) }
+    return { ambiguous: true }
+  }
+  const monthYear = trimmed.match(/^(\d{1,2})[/.-](\d{4})$/)
+  if (monthYear && parseInt(monthYear[1], 10) > 12) return null // "15/2026" is no date
+  const parts = parseDateParts(trimmed)
+  if (!parts) return null
+  const hasDay =
+    /\d{4}-\d{1,2}-\d{1,2}/.test(trimmed) ||
+    /^\d{1,2}[/.-]\d{1,2}[/.-]\d{4}$/.test(trimmed) ||
+    /^[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4}$/.test(trimmed)
+  return { value: hasDay ? `${parts.year}-${parts.month}-${parts.day}` : `${parts.year}-${parts.month}` }
+}
+
+/**
+ * Gatekeeper between "the user typed something" and "we store an answer".
+ * Rules, in order:
+ *  1. Weak question key (humanized name/id or bare section heading) → skip:
+ *     an opaque key can never match another site's real wording.
+ *  2. Date fields / date-shaped values on date-cue labels → canonical ISO;
+ *     unresolvable DD/MM ambiguity → skip (honest decline over a guess).
+ *  3. Dropdown-placeholder / "2 selected" noise → skip.
+ *  4. Page-branded values ("mcwane.com" under "How did you hear…") → keep,
+ *     but pinned to this hostname via siteScope.
+ */
+export function prepareCaptureValue(
+  signal: SignalBundle,
+  raw: string,
+  context: PageContext | null,
+  hostname: string,
+  profile?: Profile,
+): PreparedCapture | SkippedCapture {
+  const value = raw.trim()
+  if (!value) return { skip: 'empty value' }
+
+  if (signal.questionSource === 'identifier' || signal.questionSource === 'section')
+    return { skip: `question key from ${signal.questionSource} — unreliable across sites` }
+
+  // Question-key hygiene FIRST (Stage 1): a key that cleaning refuses can
+  // never round-trip; a cleaned key is what every branch below stores.
+  const cleaned = cleanCaptureQuestion(signal)
+  if (isSkippedCapture(cleaned)) return cleaned
+  const question = cleaned.question
+
+  // EEO leak-proofing (Stage 1): the detector's word-boundary eeoLike gate is
+  // beatable by mashed labels ("genderdecline answerfemalemale" — the live
+  // gender-answer leak). Re-check the RAW label, the CLEANED key, and the
+  // value with the boundary-tolerant test; demographic answers never capture.
+  if (
+    looksEeoLoose(signal.label) ||
+    looksEeoLoose(question) ||
+    looksEeoLoose(signal.normalizedQuestion)
+  )
+    return { skip: 'EEO/demographic topic — never captured' }
+
+  if (VALUE_PLACEHOLDER_RE.test(value) || SELECTED_COUNT_RE.test(value))
+    return { skip: 'placeholder / multi-select counter, not an answer' }
+
+  // Workday's id-less listboxes surface their INTERNAL option ids
+  // ("fc77e3a1ab36487f9646d14f7242dd77") as display text mid-commit; a
+  // hex blob is never a human answer (live store had five of these).
+  if (OPAQUE_ID_VALUE_RE.test(value)) return { skip: 'opaque widget id, not an answer' }
+
+  const dateLike =
+    signal.kind === 'date' ||
+    ((signal.kind === 'text' || signal.kind === 'custom-dropdown') && DATE_CUE_RE.test(signal.label))
+  if (dateLike) {
+    const canon = canonicalizeDateCapture(value, profile)
+    if (canon && 'ambiguous' in canon)
+      return { skip: `ambiguous DD/MM date "${value}" — could not disambiguate` }
+    if (canon) return { value: canon.value, siteScope: null, note: '', question }
+    if (signal.kind === 'date') return { skip: `unparseable date "${value}"` }
+    // date-cue text field with a non-date value: fall through, store verbatim
+  }
+
+  if (isContextBranded(value, context, hostname))
+    return {
+      value,
+      siteScope: hostname,
+      note: `Mentions this company — scoped to ${hostname}`,
+      question,
+    }
+
+  // Company-specific QUESTIONS pin too (Stage 1): "family member employed at
+  // Novo Nordisk" answered "No" is THIS company's truth — the live store held
+  // 75 captured entries and not one siteScope. The design said page-branded
+  // answers pin; branded questions are the same leak from the other side.
+  if (isContextBranded(`${signal.label} ${question}`, context, hostname))
+    return {
+      value,
+      siteScope: hostname,
+      note: `Question names this company — scoped to ${hostname}`,
+      question,
+    }
+
+  return { value, siteScope: null, note: '', question }
+}
+
+// ---------------------------------------------------------------------------
+// Wrong-verdict feedback (two-strike demotion). Curated entries never
+// auto-demote — validation's tolerant comparison has false positives on site
+// reformatting, and flooding Review with the import bank would poison trust
+// in the queue.
+// ---------------------------------------------------------------------------
+
+export type WrongVerdictAction = 'demote' | 'strike' | 'none'
+
+/** What a validation 'wrong' on a fill from this entry should do.
+ *  Learned entries take a recorded strike first, demote on the second —
+ *  a single tolerant-comparison miss (site reformats the display text) must
+ *  not bounce an entry the user deliberately approved. */
+export function wrongVerdictAction(entry: QAEntry): WrongVerdictAction {
+  if (entry.source !== 'captured' && entry.source !== 'inferred') return 'none'
+  if (entry.status === 'needs_review') return 'none' // already gated
+  return (entry.wrongCount ?? 0) >= 1 ? 'demote' : 'strike'
+}
+
+/** Silent-merge decision for capture-time auto-aliasing: only when the typed
+ *  value IS the stored answer (or differs by page branding alone) may the new
+ *  wording merge without asking — a conflicting answer is the user's call. */
+export function shouldSilentMerge(
+  value: string,
+  entry: QAEntry,
+  context: PageContext | null | undefined,
+  hostname = '',
+): boolean {
+  const same = entry.answer.trim().toLowerCase() === value.trim().toLowerCase()
+  return same || isContextBranded(value, context, hostname)
+}
+
+/** Add the captured question as an alias of an existing entry instead of
+ *  creating a duplicate ("update existing" path, Section 11.3). Newly seen
+ *  option wordings are folded into the entry's option list. */
+export function mergeAsAlias(
+  existing: QAEntry,
+  questionText: string,
+  options: string[] = [],
+  now: number = Date.now(),
+): QAEntry {
+  const alias = questionText.trim()
+  const known = [existing.question, ...existing.aliases].map((t) => t.toLowerCase())
+  const mergedOptions = mergeOptions(existing.options, options)
+  const aliasNew = alias !== '' && !known.includes(alias.toLowerCase())
+  const optionsGrew = mergedOptions.length !== existing.options.length
+  if (aliasNew || optionsGrew) {
+    return {
+      ...existing,
+      aliases: aliasNew ? [...existing.aliases, alias] : existing.aliases,
+      options: mergedOptions,
+      updatedAt: now,
+    }
+  }
+  return existing
+}
+
+// ---------------------------------------------------------------------------
+// Generalization (Section 11 + NOTE.MD): detect literal company/role/location
+// strings from the capture-time context and offer replacing them with
+// template variables — but always via a previewed diff the user confirms,
+// never a blind regex swap.
+// ---------------------------------------------------------------------------
+
+export interface GeneralizationSpan {
+  start: number
+  end: number
+  literal: string
+  variable: 'company' | 'role' | 'location'
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * Find every occurrence of the captured context's literals in the answer.
+ * Word-boundary matched and case-insensitive; short literals (< 3 chars) are
+ * skipped — a company named "So" would generalize half the sentence.
+ */
+export function findGeneralizations(
+  answer: string,
+  context: PageContext | null | undefined,
+): GeneralizationSpan[] {
+  if (!context) return []
+  const spans: GeneralizationSpan[] = []
+  const sources: [string | null, GeneralizationSpan['variable']][] = [
+    [context.company, 'company'],
+    [context.role, 'role'],
+    [context.location, 'location'],
+  ]
+  for (const [literal, variable] of sources) {
+    if (!literal || literal.trim().length < 3) continue
+    const re = new RegExp(`(?<![\\w])${escapeRegExp(literal.trim())}(?![\\w])`, 'gi')
+    for (const m of answer.matchAll(re)) {
+      spans.push({ start: m.index, end: m.index + m[0].length, literal: m[0], variable })
+    }
+  }
+  // Sort by position; drop overlaps (e.g. role text containing company name)
+  spans.sort((a, b) => a.start - b.start || b.end - a.end)
+  const result: GeneralizationSpan[] = []
+  let lastEnd = -1
+  for (const span of spans) {
+    if (span.start >= lastEnd) {
+      result.push(span)
+      lastEnd = span.end
+    }
+  }
+  return result
+}
+
+/** Apply the (user-confirmed subset of) generalization spans. */
+export function applyGeneralizations(answer: string, spans: GeneralizationSpan[]): string {
+  const sorted = [...spans].sort((a, b) => b.start - a.start)
+  let result = answer
+  for (const span of sorted) {
+    result = `${result.slice(0, span.start)}{{${span.variable}}}${result.slice(span.end)}`
+  }
+  return result
+}

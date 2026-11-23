@@ -1,0 +1,70 @@
+{
+  "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAz3iT9YrREa1nXqpcRvvAtDaydnHM14j3ABj1Ug6jYpMV2T21FOzWm6+3PjqKvY8E3FrOYn3hR6/cpfVByQZDOIH+uWTVTqbX53sk7lEczsb9uVWWr/aZGojSBkxwS3N9EcRJGb73+oKbPZjMHZ/uaW8L3txNJmHboD10asuPt01rgkTtjS3d/+8pG1QZqIPysP/FHbdIyyTJ4hzL3MDDxjKhXz2dyRrDQSjYBoXdxmbNkN6bfgNNhVGWcuLhKtE2WIh0uelCD6bIS3NIibR4UjPFSHlnO7zp01ScHHkNFw/AJnRmy5HgynBhMCED9ooSVd2O6Y1hD/HUpi1jBXN5twIDAQAB",
+  "name": "FlashFiller",
+  "version": "0.8.1",
+  "description": "Retrieval-based autofill for job applications. Train it with your answers once; it fills matching fields locally. Never auto-submits; data stays on your machine unless you opt into the AI judge/planner (your own API keys).",
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "activeTab",
+    "scripting",
+    "debugger",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ],
+  "action": {
+    "default_popup": "src/ui/popup/index.html",
+    "default_title": "FlashFiller"
+  },
+  "options_page": "src/ui/options/index.html",
+  "side_panel": {
+    "default_path": "src/ui/sidepanel/index.html"
+  },
+  "background": {
+    "service_worker": "service-worker-loader.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "js": [
+        "assets/index.ts-loader-CxSow0wF.js"
+      ],
+      "matches": [
+        "https://*/*",
+        "http://*/*"
+      ],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "resources": [
+        "seed-questions.json"
+      ],
+      "use_dynamic_url": false
+    },
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "resources": [
+        "assets/storage-DrgdSKCL.js",
+        "assets/seed-CEX56cSr.js",
+        "assets/planner-B0wKr8bs.js",
+        "assets/eeo-C8X2VxtH.js",
+        "assets/validation-report-CTSZ6ve_.js",
+        "assets/index.ts-CFFDyLJO.js"
+      ],
+      "use_dynamic_url": false
+    }
+  ]
+}

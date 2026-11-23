@@ -1,0 +1,1442 @@
+import { useEffect, useRef, useState } from 'react'
+import {
+  TAILOR_BASE_URL,
+  STAGE_LABELS,
+  type FinalizeRequest,
+  type HealthResponse,
+  type TailorBullet,
+  type TailorEngine,
+  type TailorFamily,
+  type TailorJob,
+  type TailorMeasurement,
+  type TailorResult,
+  type TailorSkillLine,
+} from '@contract/types'
+import { captureActiveTabJd, toRequest, type CapturedJd } from '@/lib/jd-capture'
+import { recordActiveTabJob, recordFormJob, type JobCapture } from '@/lib/job-capture'
+import { activeTabUrl, clearSessionCapture, loadSessionCapture, recordApplication, saveSessionCapture } from '@/lib/applications'
+import { ApplicationPanel } from '@/ui/components/ApplicationPanel'
+import { V6_PRESETS, V7_PRESETS, presetId, type TailorPreset } from '@/lib/tailor'
+import {
+  FinalizeRejectedError,
+  TailorOfflineError,
+  cancelJob,
+  checkHealth,
+  clearActiveRun,
+  clearDraftEdits,
+  downloadCoverLetterDocument,
+  downloadResultDocument,
+  estimateCostUsd,
+  estimateCoverLetterCostUsd,
+  estimateRedraftCostUsd,
+  finalizeJob,
+  getActiveRun,
+  getDraftEdits,
+  getJob,
+  getTailorConfig,
+  isUnknownJobError,
+  listFamilies,
+  measureEdits,
+  pollCoverLetter,
+  pollUntilDone,
+  requestCoverLetter,
+  saveActiveRun,
+  saveCoverLetterAsDocument,
+  saveDraftEdits,
+  saveResultAsDocument,
+  setTailorConfig,
+  startTailor,
+} from '@/lib/tailor'
+
+// ---------------------------------------------------------------------------
+// Tailor tab — generate a résumé for the posting in the active tab.
+//
+// Everything here is opt-in and honest by default:
+//   * service not running  → says so, with the command to start it. No retries.
+//   * no API key / stale vault → surfaced from /health BEFORE the user commits
+//     to a paid run, not discovered halfway through.
+//   * every run costs money → estimate shown, confirmation required.
+//   * gate flagged the bullets → warning stays on screen and the save button
+//     says so; the document is never quietly treated as finished work.
+//
+// The generated .docx lands in the existing document store, so from the moment
+// it is saved the rest of FlashFiller treats it exactly like a hand-uploaded
+// résumé: pickDocument matches it, fillFileUpload attaches it, validate checks.
+//
+// v6 (Plan 17): the same fifteen boxes, now with the physical rules the v6
+// engine enforces shown under each box (rendered lines / characters, measured
+// by the service as you type), the role-family lens the draft was written
+// with, the page-fit meter, per-bullet provenance (which facts, what still
+// needs Aishwar's confirmation) and the hidden keyword block for pruning.
+// An edit over its line limit is refused by /finalize (422) — nothing is
+// trimmed behind the reviewer's back; the box turns red and the button says
+// what to shorten.
+// ---------------------------------------------------------------------------
+
+function costLabel(usd: number): string {
+  return `$${usd.toFixed(2)}`
+}
+
+const OVER = { borderColor: 'var(--danger)', boxShadow: '0 0 0 1px var(--danger)' } as const
+const OK_CHIP = {
+  background: 'rgba(16,185,129,0.15)', color: 'var(--ok)', border: '1px solid rgba(16,185,129,0.3)', textShadow: 'none',
+} as const
+
+/** What the local edits look like on the wire — the same body /measure and /finalize take. */
+export function buildEdits(
+  result: TailorResult,
+  editSummary: string,
+  editSkills: TailorSkillLine[],
+  editBullets: Record<number, string>,
+  editHidden: string | null,
+  onlyChanged: boolean,
+): FinalizeRequest {
+  const edits: FinalizeRequest = {}
+  const summaryNow = editSummary.trim()
+  if (summaryNow && (!onlyChanged || summaryNow !== (result.summary ?? '').trim())) edits.summary = summaryNow
+  const skillsNow = editSkills
+    .map((s) => ({ category: s.category.trim(), skills: s.skills.trim() }))
+    .filter((s) => s.category && s.skills)
+  const skillsWere = (result.skills ?? []).map((s) => ({ category: s.category.trim(), skills: s.skills.trim() }))
+  if (skillsNow.length && (!onlyChanged || JSON.stringify(skillsNow) !== JSON.stringify(skillsWere))) {
+    edits.skills = skillsNow
+  }
+  const bulletEdits = result.bullets
+    .map((b) => ({ slot: b.slot, text: (editBullets[b.slot] ?? b.text).trim() }))
+    .filter((e) => e.text && (!onlyChanged || e.text !== (result.bullets.find((b) => b.slot === e.slot)?.text ?? '').trim()))
+  if (bulletEdits.length) edits.bullets = bulletEdits
+  if (editHidden !== null && (result.engine === 'v6' || result.engine === 'v7')) {
+    const hiddenNow = editHidden.split(',').map((t) => t.trim()).filter(Boolean).join(', ')
+    if (!onlyChanged || hiddenNow !== (result.hiddenKeywords ?? '').trim()) edits.hiddenKeywords = hiddenNow
+  }
+  return edits
+}
+
+/** Counter text under a box: the measured truth when we have it, characters meanwhile. */
+export function counterText(m: TailorMeasurement | undefined, chars: number, maxChars: number | null | undefined, lineRule: string): string {
+  const cap = maxChars ? `${chars}/${maxChars} chars` : `${chars} chars`
+  if (!m) return `${cap} · ${lineRule}`
+  const lines = `${m.lines} line${m.lines === 1 ? '' : 's'}`
+  return m.ok ? `${cap} · ${lines} ✓` : `${cap} · ${lines} — ${m.message ?? 'over the limit'}`
+}
+
+function confidenceChip(b: TailorBullet) {
+  switch (b.confidence) {
+    case 'verified':
+      return <span className="chip" style={OK_CHIP} title="Every cited fact is verified">verified</span>
+    case 'confirm':
+      return <span className="chip warn-chip" title={(b.askAishwar ?? []).join('\n') || 'A number Aishwar has not confirmed'}>confirm number</span>
+    case 'framing':
+      return <span className="chip warn-chip" title={(b.askAishwar ?? []).join('\n') || 'Rests on a lens angle Aishwar has not confirmed'}>ask Aishwar</span>
+    case 'adjacent':
+      return <span className="chip gray" title="Rests on an adjacent fact — claim level capped">adjacent</span>
+    case 'unsupported':
+      return <span className="chip warn-chip" title="No fact cited">no fact cited</span>
+    default:
+      return null
+  }
+}
+
+export function TailorTab() {
+  const [health, setHealth] = useState<HealthResponse | null>(null)
+  const [checking, setChecking] = useState(true)
+  const [token, setToken] = useState('')
+  const [baseUrl, setBaseUrl] = useState(TAILOR_BASE_URL)
+  const [tokenSaved, setTokenSaved] = useState(false)
+  const [urlError, setUrlError] = useState<string | null>(null)
+
+  const [captured, setCaptured] = useState<CapturedJd | null>(null)
+  const [jobCapture, setJobCapture] = useState<JobCapture | null>(null)
+  const [role, setRole] = useState('')
+  const [company, setCompany] = useState('')
+  const [jdText, setJdText] = useState('')
+
+  const [job, setJob] = useState<TailorJob | null>(null)
+  const [result, setResult] = useState<TailorResult | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [status, setStatus] = useState<string | null>(null)
+  const [running, setRunning] = useState(false)
+  const [makeDefault, setMakeDefault] = useState(true)
+  const [showToken, setShowToken] = useState(false)
+  const abort = useRef<AbortController | null>(null)
+
+  // Engine + lens (v6, Plan 17). Persisted with the service config so the
+  // choice survives reopening the popup. '' = the router picks the family.
+  const [engine, setEngine] = useState<TailorEngine>('v6')
+  const [domain, setDomain] = useState('')
+  // Stage 5: the model preset (writer / extractor) and the jobs row the next run is for.
+  const [preset, setPreset] = useState<TailorPreset>({})
+  const recordedJobId = useRef<string | null>(null)   // the `jobs` row the last record stored — rides on every request
+  const [sessionJobId, setSessionJobId] = useState<string | null>(null)   // the same id as state — the application panel keys on it (Stage 6)
+  const [families, setFamilies] = useState<TailorFamily[]>([])
+  const [redraftDomain, setRedraftDomain] = useState('')
+
+  // Review-step state: the user's editable copy of the draft. Nothing is
+  // rendered until these are approved — that is the whole point of the step.
+  const [lastDryRun, setLastDryRun] = useState(false)
+  const [editSummary, setEditSummary] = useState('')
+  const [editSkills, setEditSkills] = useState<TailorSkillLine[]>([])
+  const [editBullets, setEditBullets] = useState<Record<number, string>>({})
+  const [editHidden, setEditHidden] = useState<string | null>(null)
+  const [finalizing, setFinalizing] = useState(false)
+
+  // v6 measurements: box id ('summary' | 'slot N' | 'skills <label>' |
+  // 'hidden keywords') -> the service's rendered-line verdict for the text as
+  // it is now. Refreshed, debounced, on every edit.
+  const [measured, setMeasured] = useState<Record<string, TailorMeasurement>>({})
+  const [measureError, setMeasureError] = useState<string | null>(null)
+  const [violations, setViolations] = useState<TailorMeasurement[]>([])
+
+  // Cover-letter state (v5): generated on demand by its own button, never as
+  // part of the run — the user opts into the extra spend explicitly.
+  const [letterBusy, setLetterBusy] = useState(false)
+  const [letterStatus, setLetterStatus] = useState<string | null>(null)
+
+  const beginReview = (r: TailorResult) => {
+    setEditSummary(r.summary ?? '')
+    setEditSkills((r.skills ?? []).map((s) => ({ category: s.category, skills: s.skills })))
+    setEditBullets(Object.fromEntries(r.bullets.map((b) => [b.slot, b.text])))
+    setEditHidden(r.engine === 'v6' ? (r.hiddenKeywords ?? '') : null)
+    setMeasured({})
+    setViolations([])
+    setRedraftDomain(r.domain?.id ?? '')
+    // Anything the reviewer had typed into THIS job's boxes before the popup
+    // closed comes back on top of the generated text.
+    void getDraftEdits(r.jobId).then((saved) => {
+      if (!saved) return
+      setEditSummary(saved.summary)
+      setEditSkills(saved.skills)
+      setEditBullets(saved.bullets)
+      if (r.engine === 'v6') setEditHidden(saved.hidden)
+    })
+  }
+
+  // v7 drafts review under the same physical rules (limits, hidden block) — the text is the master's.
+  const isV6Draft = !!result && !lastDryRun && !result.finalized && (result.engine === 'v6' || result.engine === 'v7')
+
+  // Measure the boxes as the user types (v6 drafts only): one debounced call
+  // for every box, so the counters show the renderer's line count, not a
+  // character guess. Failures are shown once and never block editing.
+  useEffect(() => {
+    if (!isV6Draft || !result) return
+    const handle = setTimeout(() => {
+      // Same debounce persists the typed edits, so closing the popup mid-review
+      // loses at most a third of a second of typing.
+      void saveDraftEdits({ jobId: result.jobId, summary: editSummary, skills: editSkills,
+        bullets: editBullets, hidden: editHidden, savedAt: Date.now() })
+      const body = buildEdits(result, editSummary, editSkills, editBullets, editHidden, false)
+      measureEdits(result.jobId, body)
+        .then((m) => {
+          setMeasured(Object.fromEntries(m.items.map((i) => [i.id, i])))
+          setMeasureError(null)
+        })
+        .catch((e) => setMeasureError(e instanceof Error ? e.message : String(e)))
+    }, 350)
+    return () => clearTimeout(handle)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isV6Draft, result?.jobId, editSummary, editSkills, editBullets, editHidden])
+
+  const overLimit = Object.values(measured).filter((m) => !m.ok)
+
+  const loadFamilies = async () => {
+    try {
+      setFamilies(await listFamilies())
+    } catch {
+      setFamilies([])           // an older service without /tailor/domains: the picker just stays empty
+    }
+  }
+
+  const refreshHealth = async () => {
+    setChecking(true)
+    try {
+      setHealth(await checkHealth())
+      setError(null)
+    } catch (e) {
+      setHealth(null)
+      setError(e instanceof Error ? e.message : String(e))
+    }
+    setChecking(false)
+  }
+
+  useEffect(() => {
+    void getTailorConfig().then((c) => {
+      setToken(c.token)
+      setBaseUrl(c.baseUrl)
+      setEngine(c.engine)
+      setDomain(c.domain)
+      // the stored preset, made whole: mode is v7's alone, and a full-mode preset always names its writer
+      setPreset(c.engine === 'v7'
+        ? { mode: c.mode, writerModel: c.mode === 'full' ? (c.writerModel ?? 'claude-sonnet-4-6') : null, extractorModel: c.extractorModel }
+        : { writerModel: c.writerModel, extractorModel: c.extractorModel })
+    })
+    // Stage 6: the posting read before the popup closed comes back — same site (or a sibling host of the
+    // company), twelve hours — so Preflight, Finalize and the application log key onto the same jobs row
+    void activeTabUrl().then((url) => loadSessionCapture(url)).then((session) => {
+      if (!session || recordedJobId.current) return
+      setJobCapture(session.capture)
+      recordedJobId.current = session.jobId
+      setSessionJobId(session.jobId)
+    })
+    void refreshHealth()
+    return () => abort.current?.abort()
+  }, [])
+
+  useEffect(() => {
+    if (health && token && engine === 'v6' && families.length === 0) void loadFamilies()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [health, token, engine])
+
+  // Reattach. Closing (or minimizing) the popup only ever abandoned the POLL —
+  // the service keeps drafting. On mount, pick the last real run back up:
+  // still running → resume polling exactly where it was; finished while the
+  // popup was closed → show the draft with any typed edits restored; the
+  // service forgot the job (restarted) → drop the record honestly.
+  useEffect(() => {
+    void (async () => {
+      const rec = await getActiveRun()
+      if (!rec) return
+      // Refill the posting boxes so re-draft and context survive the close too
+      // (only where the user has not already typed something this session).
+      setRole((v) => v || rec.role)
+      setCompany((v) => v || (rec.company ?? ''))
+      setJdText((v) => v || rec.jdText)
+      let current: TailorJob
+      try {
+        current = await getJob(rec.jobId)
+      } catch (e) {
+        if (isUnknownJobError(e)) void clearActiveRun()   // service restarted; the run registry is in memory
+        else if (!(e instanceof TailorOfflineError)) setError(e instanceof Error ? e.message : String(e))
+        return                                            // offline: the banner already says what to do
+      }
+      setJob(current)
+      setLastDryRun(false)
+      const adoptDone = (r: TailorResult) => {
+        setResult(r)
+        if (!r.finalized) beginReview(r)
+        setStatus(r.finalized
+          ? 'Picked your approved résumé back up — it survived the popup closing.'
+          : 'The draft finished while the popup was closed — review below, then approve.')
+        if (r.coverLetterStatus === 'running') {
+          // A letter was mid-generation too; watch it the same way.
+          setLetterBusy(true)
+          void pollCoverLetter(rec.jobId, (j) => { if (j.result) setResult(j.result) })
+            .catch((e) => setError(e instanceof Error ? e.message : String(e)))
+            .finally(() => setLetterBusy(false))
+        }
+      }
+      if (current.status === 'queued' || current.status === 'running') {
+        setRunning(true)
+        setStatus(`Reattached to the run started at ${new Date(rec.startedAt).toLocaleTimeString()} — still drafting.`)
+        abort.current = new AbortController()
+        try {
+          const finished = await pollUntilDone(rec.jobId, setJob, { signal: abort.current.signal })
+          if (finished.status === 'done' && finished.result) {
+            setResult(finished.result)
+            if (!finished.result.finalized) beginReview(finished.result)
+            setStatus(`Draft ready — ${costLabel(finished.costUsd ?? 0)} spent. Review below, then approve.`)
+          } else if (finished.status === 'failed') {
+            setError(finished.error ?? 'The run failed.')
+            void clearActiveRun()
+          } else if (finished.status === 'cancelled') {
+            setStatus('That run was cancelled.')
+            void clearActiveRun()
+          }
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e))
+        }
+        setRunning(false)
+      } else if (current.status === 'done' && current.result) {
+        adoptDone(current.result)
+      } else if (current.status === 'failed') {
+        setError(current.error ?? 'The run failed while the popup was closed.')
+        void clearActiveRun()
+      } else {
+        void clearActiveRun()                             // cancelled or empty: nothing to pick up
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const chooseEngine = async (next: TailorEngine) => {
+    setEngine(next)
+    setPreset({})                                   // presets are per engine — back to the engine's default
+    await setTailorConfig({ engine: next, mode: 'skills', writerModel: null, extractorModel: null }).catch(() => null)
+  }
+
+  const choosePreset = async (id: string) => {
+    const next = (engine === 'v7' ? V7_PRESETS : V6_PRESETS).find((p) => p.id === id)?.preset ?? {}
+    setPreset(next)
+    await setTailorConfig({ mode: next.mode ?? 'skills', writerModel: next.writerModel ?? null, extractorModel: next.extractorModel ?? null }).catch(() => null)
+  }
+
+  const chooseDomain = async (next: string) => {
+    setDomain(next)
+    await setTailorConfig({ domain: next }).catch(() => null)
+  }
+
+  const saveService = async () => {
+    setUrlError(null)
+    try {
+      // setTailorConfig validates the address before it ever reaches storage.
+      await setTailorConfig({ baseUrl: baseUrl.trim(), token: token.trim() })
+    } catch (e) {
+      setUrlError(e instanceof Error ? e.message : String(e))
+      return
+    }
+    setTokenSaved(true)
+    setTimeout(() => setTokenSaved(false), 3000)
+    await refreshHealth()
+  }
+
+  // Rendered by BOTH the offline and connected branches. Address only in the
+  // connected view would be a dead end: point it somewhere unreachable and you
+  // are offline, with no way to correct it. A plain function, NOT a nested
+  // component — a component defined in render remounts each pass and drops
+  // focus on every keystroke.
+  const serviceFields = () => (
+    <>
+      <label className="label" style={{ display: 'block', marginTop: 8 }}>
+        Service address
+        <input
+          type="text"
+          placeholder={TAILOR_BASE_URL}
+          value={baseUrl}
+          onChange={(e) => setBaseUrl(e.target.value)}
+          spellCheck={false}
+          autoComplete="off"
+          autoCapitalize="off"
+          autoCorrect="off"
+        />
+        <span className="sub">
+          Loopback, LAN or tailnet only — <code>127.0.0.1</code>, <code>192.168.x.x</code>,{' '}
+          <code>10.x.x.x</code>, <code>100.64–127.x.x</code> or a <code>.ts.net</code> name.
+          Public addresses are refused.
+        </span>
+      </label>
+      <label className="label" style={{ display: 'block', marginTop: 6 }}>
+        Service token
+        <input
+          type="password"
+          placeholder="from `make serve`"
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+          autoComplete="off"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck={false}
+        />
+      </label>
+      <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+        <button className="btn small primary" onClick={() => void saveService()}>Save</button>
+        <button className="btn small" onClick={() => void refreshHealth()}>Test connection</button>
+      </div>
+      {urlError && <div className="note warn" style={{ marginTop: 8 }}>{urlError}</div>}
+      {tokenSaved && <div className="sub" style={{ marginTop: 6 }}>Saved.</div>}
+    </>
+  )
+
+  const capture = async () => {
+    setError(null)
+    try {
+      const cap = await captureActiveTabJd()
+      setCaptured(cap)
+      setRole(cap.role ?? '')
+      setCompany(cap.company ?? '')
+      setJdText(cap.jdText)
+      setStatus(
+        cap.jdText.length > 200
+          ? `Captured ${cap.jdText.length.toLocaleString()} characters (${cap.source}).`
+          : 'Could not find a description on that page — paste it below.',
+      )
+      // Stage 4 part 2 (D13): the same press records the posting in `jobs` through the outbox —
+      // only here, never on page open.
+      const rec = await recordActiveTabJob()
+      setJobCapture(rec.capture ?? null)
+      recordedJobId.current = rec.jobId ?? null
+      setSessionJobId(rec.jobId ?? null)
+      void activeTabUrl().then((url) => saveSessionCapture(rec.capture ?? null, rec.jobId ?? null, rec.capture?.sourceUrl ?? url))   // Stage 6: survives a popup reopen
+      // the form shows what the row recorded, so a later Preflight keys the same posting
+      if (rec.capture?.title) setRole(rec.capture.title)
+      if (rec.capture?.company) setCompany(rec.capture.company)
+      setStatus((s) => (s ? `${s} ${rec.note}` : rec.note))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+    setTimeout(() => setStatus(null), 6000)
+  }
+
+  const run = async (dryRun: boolean) => {
+    setError(null)
+    setResult(null)
+    setJob(null)
+
+    const built = toRequest(captured ?? { role: null, company: null, location: null, jdText: '', url: null, source: 'none' },
+      { role, company, jdText })
+    if ('problem' in built) {
+      setError(built.problem)
+      return
+    }
+    // Stage 4 part 2: a résumé is always per company — no company, no run.
+    if (company.trim().length < 2) {
+      setError('404: Company not found in preflight — type the company name first.')
+      return
+    }
+
+    const lensNote = (engine === 'v6' || engine === 'v7')
+      ? (domain ? `\nLens: ${families.find((f) => f.id === domain)?.name ?? domain} (fixed).`
+        : '\nLens: the router reads the title and duties and picks the role family.')
+      : ''
+    if (!dryRun) {
+      const ok = confirm(
+        `Generate a tailored résumé draft for "${built.request.role}"?\n\n` +
+        `Engine ${engine} against your Anthropic key — roughly ${costLabel(estimateCostUsd(engine, preset))}, ` +
+        `a few minutes. The budget ceiling stops it going further.${lensNote}\n\n` +
+        `You review and approve the draft before any document is rendered.`,
+      )
+      if (!ok) return
+    }
+
+    setRunning(true)
+    setLastDryRun(dryRun)
+    abort.current = new AbortController()
+    try {
+      // The posting is recorded in `jobs` through the outbox after the confirm and before a cent
+      // is spent (the /batch page's own order); the buttons are disabled meanwhile.
+      const rec = await recordFormJob(jobCapture, { title: built.request.role, company: company.trim(), description: built.request.jdText })
+      setStatus(rec.note)
+      // only the row THIS press stored — a queued / refused record has no id yet, and an earlier
+      // posting's id must never ride on another JD's résumé (documents.job_id)
+      const jobIdNow = rec.jobId ?? null
+      recordedJobId.current = jobIdNow
+      setSessionJobId(jobIdNow)
+      if (jobCapture) void activeTabUrl().then((url) => saveSessionCapture(jobCapture, jobIdNow, jobCapture.sourceUrl ?? url))   // Stage 6: survives a popup reopen
+      else void clearSessionCapture()                        // a pasted JD is not the page's posting — nothing to come back to
+      const started = await startTailor({
+        ...built.request,
+        // renderDocx:false = draft mode — the document is rendered by
+        // /finalize only after the user approves (possibly edited) sections.
+        options: {
+          ...(built.request.options ?? {}),
+          dryRun,
+          renderDocx: false,
+          engine,
+          ...((engine === 'v6' || engine === 'v7') && domain ? { domain } : {}),
+          // Stage 5: the mode, the model preset and the jobs row the résumé is for
+          ...(engine === 'v7' ? { mode: preset.mode ?? 'skills' } : {}),
+          ...(preset.writerModel ? { writerModel: preset.writerModel } : {}),
+          ...(preset.extractorModel ? { extractorModel: preset.extractorModel } : {}),
+          ...(jobIdNow ? { jobId: jobIdNow } : {}),
+        },
+      })
+      setJob(started)
+      if (!dryRun) {
+        // From this moment the run survives the popup: reopening reattaches by
+        // this record even though the tab's own state is gone.
+        void clearDraftEdits()
+        void saveActiveRun({ jobId: started.jobId, role: built.request.role,
+          company: built.request.company ?? null, jdText: built.request.jdText,
+          engine, domain: (engine === 'v6' || engine === 'v7') ? domain : '', startedAt: Date.now() })
+      }
+      const finished = await pollUntilDone(started.jobId, setJob, { signal: abort.current.signal })
+      if (finished.status === 'done' && finished.result) {
+        setResult(finished.result)
+        if (!dryRun && !finished.result.finalized) beginReview(finished.result)
+        setStatus(dryRun
+          ? `Preflight complete. ${rec.note}`
+          : `Draft ready — ${costLabel(finished.costUsd ?? 0)} spent. Review below, then approve.`)
+      } else if (finished.status === 'failed') {
+        setError(finished.error ?? 'The run failed.')
+      } else if (finished.status === 'cancelled') {
+        setStatus('Run cancelled.')
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+    setRunning(false)
+  }
+
+  const stop = async () => {
+    if (job) await cancelJob(job.jobId).catch(() => null)
+    abort.current?.abort()
+    setRunning(false)
+    void clearActiveRun()          // an explicit cancel is the end of that run
+  }
+
+  /** v6: draft the same posting again under another lens. The extraction is
+   *  reused (extractFrom), so this pays for the writer only. */
+  const redraft = async () => {
+    if (!result || !redraftDomain) return
+    if (jdText.trim().length < 200) {
+      setError('The job description is no longer in the box above — paste it back before re-drafting.')
+      return
+    }
+    const fam = families.find((f) => f.id === redraftDomain)
+    const ok = confirm(
+      `Re-draft "${result.role}" with the ${fam?.name ?? redraftDomain} lens?\n\n` +
+      `Reuses this run's keyword extraction — roughly ${costLabel(estimateRedraftCostUsd(preset))}` +
+      `${preset.writerModel ? ` (${preset.writerModel} writer)` : ''}. ` +
+      `The current draft stays in its run folder (${result.runDir ?? 'runs'}).`,
+    )
+    if (!ok) return
+    setError(null)
+    setRunning(true)
+    setLastDryRun(false)
+    abort.current = new AbortController()
+    try {
+      const started = await startTailor({
+        role: result.role,
+        company: result.company ?? null,
+        jdText,
+        source: 'extension',
+        options: {
+          renderDocx: false, engine: 'v6', domain: redraftDomain, extractFrom: result.runDir ?? null,
+          ...(preset.writerModel ? { writerModel: preset.writerModel } : {}),
+          ...(recordedJobId.current ? { jobId: recordedJobId.current } : {}),
+        },
+      })
+      setJob(started)
+      void clearDraftEdits()
+      void saveActiveRun({ jobId: started.jobId, role: result.role, company: result.company ?? null,
+        jdText, engine: 'v6', domain: redraftDomain, startedAt: Date.now() })
+      const finished = await pollUntilDone(started.jobId, setJob, { signal: abort.current.signal })
+      if (finished.status === 'done' && finished.result) {
+        setResult(finished.result)
+        beginReview(finished.result)
+        setStatus(`Re-drafted with the ${finished.result.domain?.name ?? redraftDomain} lens — ${costLabel(finished.costUsd ?? 0)} spent.`)
+      } else if (finished.status === 'failed') {
+        setError(finished.error ?? 'The re-draft failed.')
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+    setRunning(false)
+  }
+
+  const save = async () => {
+    if (!result) return
+    try {
+      const saved = await saveResultAsDocument(result, { makeDefault })
+      setStatus(
+        makeDefault
+          ? `Saved "${saved.name}" and starred it — this is the résumé that will attach next.`
+          : `Saved "${saved.name}". Another résumé is still starred, so star this one in Documents ` +
+          'if you want it attached instead.',
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  /** Approve the draft: send ONLY what actually changed. An edited piece is
+   *  human-reviewed by definition, so the service clears its flags; anything
+   *  untouched keeps its generated text — and its warnings. */
+  const approve = async () => {
+    if (!result) return
+    setFinalizing(true)
+    setError(null)
+    setViolations([])
+    try {
+      const edits = buildEdits(result, editSummary, editSkills, editBullets, editHidden, true)
+      const finished = await finalizeJob(result.jobId, edits)
+      if (finished.result) {
+        setResult(finished.result)
+        if (recordedJobId.current) {
+          // Stage 6: the application log — `drafted`, with the documents rows the hub registered.
+          // Never `submitted`: only the "I submitted" button says that.
+          void recordApplication({
+            kind: 'drafted', jobId: recordedJobId.current,
+            resumeDocumentId: finished.result.documentId ?? null,
+            coverLetterDocumentId: finished.result.coverLetterDocumentId ?? null,
+            title: finished.result.role, company: finished.result.company ?? null,
+          }).then((o) => setStatus((s) => (s ? `${s} · ${o.note}` : o.note)))
+        }
+        void clearDraftEdits()     // the edits are baked into the document now
+        const n = (edits.bullets?.length ?? 0) + (edits.summary ? 1 : 0) + (edits.skills ? 1 : 0)
+          + (edits.hiddenKeywords !== undefined ? 1 : 0)
+        setStatus((n
+          ? `Approved with ${n} edit${n === 1 ? '' : 's'} — résumé drafted below.`
+          : 'Approved as generated — résumé drafted below.')
+          // Stage 6: an approval with no jobs row cannot be logged — said, never silent
+          + (recordedJobId.current ? '' : ' · Not logged as an application — this run has no jobs row (Read this page, then Preflight, next time).'))
+      }
+    } catch (e) {
+      if (e instanceof FinalizeRejectedError) {
+        // Nothing was written or trimmed. Mark the boxes and say what to shorten.
+        setViolations(e.violations)
+        setMeasured((prev) => ({ ...prev, ...Object.fromEntries(e.violations.map((v) => [v.id, v])) }))
+        setError(`Not drafted — ${e.violations.map((v) => `${v.id}: ${v.message ?? 'over the limit'}`).join('; ')}. ` +
+          'Shorten the marked boxes and approve again; nothing is trimmed for you.')
+      } else {
+        setError(e instanceof Error ? e.message : String(e))
+      }
+    }
+    setFinalizing(false)
+  }
+
+  /** Start (or restart) letter generation for the current run and poll it in. */
+  const generateLetter = async () => {
+    if (!result) return
+    const regenerating = result.coverLetterStatus === 'done'
+    const ok = confirm(
+      `${regenerating ? 'Regenerate' : 'Generate'} a cover letter for "${result.role}"?\n\n` +
+      `Uses this run's analysis and your verified résumé record — roughly ` +
+      `${costLabel(estimateCoverLetterCostUsd())}, under a minute. The résumé is untouched.`,
+    )
+    if (!ok) return
+    setLetterBusy(true)
+    setLetterStatus(null)
+    setError(null)
+    try {
+      await requestCoverLetter(result.jobId)
+      const finished = await pollCoverLetter(
+        result.jobId,
+        (j) => { if (j.result) setResult(j.result) },
+        { signal: abort.current?.signal ?? undefined },
+      )
+      const r = finished.result
+      if (r?.coverLetterStatus === 'done') {
+        if (recordedJobId.current && r.coverLetterDocumentId) {
+          // Stage 6: link the letter's documents row to the application; the status does not move
+          void recordApplication({ kind: 'cover_letter', jobId: recordedJobId.current, coverLetterDocumentId: r.coverLetterDocumentId })
+        }
+        setLetterStatus(r.coverLetter?.needsHumanReview
+          ? 'Cover letter drafted — the gate flagged parts of it; read before sending.'
+          : 'Cover letter drafted.')
+      } else if (r?.coverLetterStatus === 'failed') {
+        setError(r.coverLetterError ?? 'Cover letter generation failed.')
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+    setLetterBusy(false)
+  }
+
+  const copyLetter = async () => {
+    if (!result?.coverLetter?.text) return
+    try {
+      await navigator.clipboard.writeText(result.coverLetter.text)
+      setLetterStatus('Letter copied to the clipboard.')
+    } catch {
+      setLetterStatus('Could not copy — select the text and copy it manually.')
+    }
+  }
+
+  const saveLetter = async () => {
+    if (!result) return
+    try {
+      const saved = await saveCoverLetterAsDocument(result)
+      setLetterStatus(`Saved "${saved.name}" to Documents as a cover letter — it will only ` +
+        'ever be offered to cover-letter upload zones.')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  // --- service down ---------------------------------------------------------
+  if (!checking && !health) {
+    return (
+      <div>
+        <h3>Tailor</h3>
+        <p className="muted">
+          Generates a résumé tailored to a specific posting, then drops it straight into your
+          Documents so it attaches like any other stored résumé.
+        </p>
+        <div className="note" style={{ marginTop: 10 }}>
+          <strong>The Tailor service isn’t running.</strong>
+          <div className="sub" style={{ marginTop: 6 }}>
+            Start it from the project root:
+            <pre style={{ margin: '6px 0', whiteSpace: 'pre-wrap' }}>make serve</pre>
+            Nothing is sent anywhere until it is running — FlashFiller does not retry in the
+            background.
+          </div>
+        </div>
+        {error && <div className="note warn" style={{ marginTop: 8 }}>{error}</div>}
+        {serviceFields()}
+      </div>
+    )
+  }
+
+  const engineReady = engine === 'v6' ? health?.v6Ready !== false : engine === 'v7' ? health?.v7Ready === true : !!health?.vaultReady
+  const blocked = health ? !health.apiKeyPresent || !engineReady : false
+  const stage = job?.stage ? (STAGE_LABELS[job.stage] ?? job.stage) : null
+
+  return (
+    <div>
+      <h3>Tailor</h3>
+      <p className="muted">
+        Reads the posting in the active tab and drafts a summary, skills section, and STAR bullets
+        against your vault. You review and edit the draft; only after you approve does it render the
+        ATS-clean .docx for Documents. Never submits anything.
+      </p>
+
+      {checking && <div className="note">Checking the service…</div>}
+
+      <ApplicationPanel jobId={sessionJobId} title={result?.role ?? role} company={result?.company ?? company} />
+
+      {/* Service + token row.
+          `/health` is deliberately public so this tab can report the service is
+          up before anything is configured — which meant a RUNNING service
+          rendered this view with the token field nowhere on screen, and the
+          only way to reach it was to stop the service. The token belongs here,
+          reachable whatever the connection state. */}
+      {health && (
+        <div className="note" style={{ marginTop: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <span>Service connected{health.activeJobs ? ` · ${health.activeJobs} job running` : ''}</span>
+            <span style={{ flex: 1 }} />
+            <button className="btn small" onClick={() => setShowToken((v) => !v)}>
+              {token ? 'Change address / token' : 'Set address & token'}
+            </button>
+          </div>
+
+          {(showToken || !token) && serviceFields()}
+
+          {!token && (
+            <div className="sub" style={{ marginTop: 6 }}>
+              Required before <strong>Generate</strong> — without it the service returns 401.
+              It is printed when <code>make serve</code> starts, and cached in{' '}
+              <code>apps/mapper/.tailor-token</code>.
+            </div>
+          )}
+          {tokenSaved && <div className="sub" style={{ marginTop: 6 }}>Token saved.</div>}
+        </div>
+      )}
+
+      {health && blocked && (
+        <div className="note warn" style={{ marginTop: 8 }}>
+          <strong>Not ready to run.</strong>
+          <ul style={{ margin: '6px 0 0 16px' }}>
+            {!health.apiKeyPresent && <li>ANTHROPIC_API_KEY is not set — paid runs are refused.</li>}
+            {engine === 'v5' && !health.vaultReady && <li>{health.vaultDetail}</li>}
+            {engine === 'v7' && health.v7Ready !== true && (
+              <li>The v7 engine is not ready on the service (main_v7, its prompt set or the master library is missing — `python3 src/v7/main_v7.py --sync-masters`).</li>
+            )}
+            {engine === 'v6' && health.v6Ready === false && (
+              <li>The v6 engine is not ready on the service (main_v6, its prompt set or the fact bank is missing).</li>
+            )}
+          </ul>
+        </div>
+      )}
+
+      {/* Engine + lens. v6 is the default; v5 stays one click away as the
+          fallback. The lens picker lists the 31 role families from the service
+          — leave it on "router" unless you know the posting's family better
+          than its title and duties say. */}
+      {health && (
+        <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <label className="muted" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            Engine
+            <select value={engine} onChange={(e) => void chooseEngine(e.target.value as TailorEngine)} disabled={running}>
+              <option value="v6">v6 — two agents, one page, role-family lens</option>
+              <option value="v7">v7 — over the master library (skills ≈ $0.03 · full ≈ $0.06)</option>
+            </select>
+          </label>
+          <label className="muted" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            Models
+            <select value={presetId(engine, preset)} onChange={(e) => void choosePreset(e.target.value)} disabled={running}>
+              {(engine === 'v7' ? V7_PRESETS : V6_PRESETS).map((p) => (
+                <option key={p.id} value={p.id}>{p.label}</option>
+              ))}
+            </select>
+          </label>
+          {(engine === 'v6' || engine === 'v7') && (
+            <label className="muted" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              Lens
+              <select value={domain} onChange={(e) => void chooseDomain(e.target.value)} disabled={running}>
+                <option value="">router picks the family</option>
+                {families.map((f) => (
+                  <option key={f.id} value={f.id}>
+                    {f.id} · {f.name}{engine === 'v7'
+                      ? (f.hasMaster ? '' : ' (no master yet — nearest family used, flagged)')
+                      : (f.hasProfile ? '' : ' (no profile yet — generic writer)')}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+        </div>
+      )}
+
+      <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button className="btn primary" onClick={() => void capture()} disabled={running}>
+          Read this page
+        </button>
+        <button className="btn" onClick={() => void run(true)} disabled={running}>
+          Preflight (free)
+        </button>
+        <button className="btn" onClick={() => void run(false)} disabled={running || blocked}>
+          Generate — ~{costLabel(estimateCostUsd(engine, preset))}
+        </button>
+        {running && <button className="btn small danger" onClick={() => void stop()}>Stop</button>}
+      </div>
+
+      {status && <div className="note" style={{ marginTop: 8 }}>{status}</div>}
+      {error && <div className="note warn" style={{ marginTop: 8 }}>{error}</div>}
+
+      <div style={{ marginTop: 12, display: 'grid', gap: 8 }}>
+        <label className="label">
+          Job title
+          <input value={role} onChange={(e) => setRole(e.target.value)} placeholder="Junior Manufacturing Engineer" />
+        </label>
+        <label className="label">
+          Company
+          <input value={company} onChange={(e) => setCompany(e.target.value)} />
+        </label>
+        <label className="label">
+          Job description
+          <textarea
+            rows={8}
+            value={jdText}
+            onChange={(e) => setJdText(e.target.value)}
+            placeholder="Captured from the page, or paste it here."
+          />
+          <span className="sub">
+            {jdText.length.toLocaleString()} characters
+            {captured?.source && captured.source !== 'none' ? ` · via ${captured.source}` : ''}
+            {jdText.length > 0 && jdText.length < 200 ? ' · too short to run' : ''}
+          </span>
+        </label>
+      </div>
+
+      {job && running && (
+        <div className="note" style={{ marginTop: 12 }}>
+          <strong>{stage ?? 'Working'}…</strong>
+          <div className="sub">
+            {Math.round((job.progress ?? 0) * 100)}% · job {job.jobId}
+            {job.costUsd ? ` · ${costLabel(job.costUsd)} so far` : ''}
+          </div>
+        </div>
+      )}
+
+      {/* ---- dry-run: the preflight notes, nothing to review ------------- */}
+      {result && lastDryRun && (
+        <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+          <strong>Preflight</strong>
+          <ol style={{ margin: '10px 0 0 18px', padding: 0 }}>
+            {result.bullets.map((b) => (
+              <li key={b.slot} style={{ marginBottom: 6 }}>{b.text}</li>
+            ))}
+          </ol>
+        </div>
+      )}
+
+      {/* ---- draft review: view + edit, nothing rendered until approval --- */}
+      {result && !lastDryRun && !result.finalized && (
+        <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <strong>Review the draft</strong>
+            <span className="muted">· {costLabel(result.costUsd)} spent · nothing is rendered until you approve</span>
+          </div>
+
+          {/* v6: which lens wrote this, does it fit one page, what a parser scores it */}
+          {isV6Draft && (
+            <div className="note" style={{ marginTop: 8 }}>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                <span className="chip gray">v6</span>
+                {result.domain && (
+                  <span
+                    className={result.domain.generic ? 'chip warn-chip' : 'chip'}
+                    title={result.domain.reason ?? undefined}
+                  >
+                    {result.domain.generic
+                      ? 'generic writer — no lens profile yet'
+                      : `lens · ${result.domain.name ?? result.domain.slug}`}
+                    {result.domain.subCategory ? ` · ${result.domain.subCategory}` : ''}
+                    {result.domain.fixed ? ' · fixed' : ' · router'}
+                  </span>
+                )}
+                {result.domain?.fixed && result.domain.routerId && result.domain.routerId !== result.domain.id && (
+                  <span className="chip gray" title="The router read the title and duties and would have chosen this family">
+                    router preferred {result.domain.routerName ?? result.domain.routerId}
+                  </span>
+                )}
+                {result.pageFit && (
+                  <span className={result.pageFit.fits ? 'chip' : 'chip warn-chip'} style={result.pageFit.fits ? OK_CHIP : undefined}
+                    title={result.pageFit.steps.length ? `Fit steps: ${result.pageFit.steps.join('; ')}` : 'No fit steps needed'}>
+                    {result.pageFit.fits ? 'one page' : 'over one page'}
+                    {result.pageFit.usedPt != null && result.pageFit.availablePt != null
+                      ? ` · ${Math.round(result.pageFit.usedPt)}/${Math.round(result.pageFit.availablePt)} pt` : ''}
+                  </span>
+                )}
+                {result.atsScore && (
+                  <span className="chip gray" title="Jobscan-style pre-score: hidden keyword block included / visible text only">
+                    ATS {result.atsScore.parsed ?? '–'} parsed · {result.atsScore.visible ?? '–'} visible
+                  </span>
+                )}
+              </div>
+              {result.pageFit && result.pageFit.steps.length > 0 && (
+                <div className="sub" style={{ marginTop: 4 }}>Fit ladder: {result.pageFit.steps.join('; ')}.</div>
+              )}
+              {families.length > 0 && result.engine === 'v6' && (   /* a re-draft is v6's writer over v6's run — never offered on a v7 draft */
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginTop: 6 }}>
+                  <span className="sub">Re-draft with another lens (v6 writer only, ~{costLabel(estimateRedraftCostUsd(preset))}):</span>
+                  <select value={redraftDomain} onChange={(e) => setRedraftDomain(e.target.value)} disabled={running || finalizing}>
+                    <option value="">choose a family…</option>
+                    {families.map((f) => (
+                      <option key={f.id} value={f.id}>{f.id} · {f.name}{f.hasProfile ? '' : ' (generic)'}</option>
+                    ))}
+                  </select>
+                  <button className="btn small" onClick={() => void redraft()}
+                    disabled={running || finalizing || !redraftDomain || redraftDomain === result.domain?.id}>
+                    Re-draft
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {result.needsHumanReview && (
+            <div className="note warn" style={{ marginTop: 8 }}>
+              <strong>The pipeline flagged parts of this draft.</strong>{' '}
+              {result.reviewReason ?? 'Some pieces did not clear the gate.'}
+              <div className="sub" style={{ marginTop: 4 }}>
+                Fix them here — anything you edit counts as reviewed; anything you leave keeps its ⚠.
+              </div>
+            </div>
+          )}
+
+          {isV6Draft && (result.setDefects?.length ?? 0) > 0 && (
+            <details style={{ marginTop: 8 }}>
+              <summary className="sub" style={{ cursor: 'pointer' }}>
+                {result.setDefects!.length} set-level note{result.setDefects!.length === 1 ? '' : 's'} on the bullets as a group
+              </summary>
+              <ul style={{ margin: '4px 0 0 16px' }}>
+                {result.setDefects!.map((d, i) => <li key={i} className="sub">{d}</li>)}
+              </ul>
+            </details>
+          )}
+
+          {measureError && isV6Draft && (
+            <div className="sub warn" style={{ marginTop: 8 }}>
+              Live measurement unavailable ({measureError}) — the service still checks every box on approve.
+            </div>
+          )}
+
+          {result.summary != null ? (
+            <label className="label" style={{ marginTop: 12, display: 'block' }}>
+              Professional summary
+              {isV6Draft && (result.summaryDefects?.length ?? 0) > 0 && (
+                <span className="warn" title={result.summaryDefects!.join('\n')}> ⚠ {result.summaryDefects!.length}</span>
+              )}
+              <textarea
+                rows={3}
+                value={editSummary}
+                onChange={(e) => setEditSummary(e.target.value)}
+                style={isV6Draft && measured['summary'] && !measured['summary'].ok ? OVER : undefined}
+              />
+              <span className="sub" style={isV6Draft && measured['summary'] && !measured['summary'].ok ? { color: 'var(--danger)' } : undefined}>
+                {editSummary.trim().split(/\s+/).filter(Boolean).length} words
+                {isV6Draft && result.limits
+                  ? ` · ${counterText(measured['summary'], editSummary.trim().length, result.limits.summaryChars,
+                      `${result.limits.summaryMinLines}–${result.limits.summaryMaxLines} lines`)}`
+                  : ''}
+              </span>
+            </label>
+          ) : (
+            <div className="note" style={{ marginTop: 12 }}>
+              This run produced bullets only — no summary/skills sections (pre-Phase-6 pipeline).
+            </div>
+          )}
+
+          {editSkills.length > 0 && (
+            <div style={{ marginTop: 10 }}>
+              <div className="label">
+                Technical skills
+                {isV6Draft && <span className="sub"> · each line renders on exactly one line; what would wrap goes to the hidden block</span>}
+              </div>
+              {editSkills.map((line, i) => {
+                const m = isV6Draft ? measured[`skills ${line.category.trim().replace(/:$/, '')}`] : undefined
+                const orig = result.skills?.[i]
+                return (
+                  <div key={i} style={{ marginTop: 6 }}>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <input
+                        value={line.category}
+                        onChange={(e) =>
+                          setEditSkills((prev) => prev.map((l, j) => (j === i ? { ...l, category: e.target.value } : l)))
+                        }
+                        style={{ flex: '0 0 38%' }}
+                        placeholder="Category:"
+                      />
+                      <input
+                        value={line.skills}
+                        onChange={(e) =>
+                          setEditSkills((prev) => prev.map((l, j) => (j === i ? { ...l, skills: e.target.value } : l)))
+                        }
+                        style={{ flex: 1, ...(m && !m.ok ? OVER : {}) }}
+                        placeholder="Skill, skill, skill"
+                      />
+                    </div>
+                    {isV6Draft && (
+                      <span className="sub" style={m && !m.ok ? { color: 'var(--danger)' } : undefined}>
+                        {orig?.source === 'code' ? 'code-built toolkit line · ' : ''}
+                        {counterText(m, line.skills.trim().length, orig?.maxChars, 'one line')}
+                        {(orig?.movedToHidden?.length ?? 0) > 0 ? ` · moved to hidden: ${orig!.movedToHidden!.join(', ')}` : ''}
+                      </span>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+
+          <div style={{ marginTop: 10 }}>
+            <div className="label">
+              Experience bullets
+              {isV6Draft && result.limits && (
+                <span className="sub"> · two lines max (slots {result.limits.oneLineSlots.join(' and ')}: one line) · measured as you type</span>
+              )}
+            </div>
+            {result.bullets.map((b) => {
+              const m = isV6Draft ? measured[`slot ${b.slot}`] : undefined
+              const text = editBullets[b.slot] ?? b.text
+              const edited = text.trim() !== b.text.trim()
+              const oneLine = b.length === 'one_line'
+              return (
+                <div key={b.slot} style={{ marginTop: 8 }}>
+                  <span className="sub" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <span>{b.slot}. [{b.category}]</span>
+                    {isV6Draft && <span className="chip gray">{oneLine ? 'one line' : 'two lines'}</span>}
+                    {isV6Draft && !edited && confidenceChip(b)}
+                    {isV6Draft && b.codeTrimmed && !edited && (
+                      <span className="chip warn-chip" title="Code cut this bullet at a clause boundary to meet its lines — read it">code-trimmed</span>
+                    )}
+                    {isV6Draft && b.humanEdited && <span className="chip gray">your text</span>}
+                    {(b.notes?.length ?? 0) > 0 && (
+                      <div className="sub" style={{ marginTop: 2 }} title="What the engine did to this slot (v7 full mode)">
+                        {b.notes!.join(' · ')}
+                      </div>
+                    )}
+                    {b.needs_human_review && !edited && (
+                      <span className="warn" title={(b.defects ?? []).join('\n') || undefined}> ⚠ flagged</span>
+                    )}
+                    {isV6Draft && edited && <span className="chip gray">edited — physical rules only</span>}
+                  </span>
+                  <textarea
+                    rows={oneLine ? 2 : 3}
+                    value={text}
+                    onChange={(e) => setEditBullets((prev) => ({ ...prev, [b.slot]: e.target.value }))}
+                    style={{ width: '100%', marginTop: 2, ...(m && !m.ok ? OVER : {}) }}
+                  />
+                  {isV6Draft && (
+                    <span className="sub" style={m && !m.ok ? { color: 'var(--danger)' } : undefined}>
+                      {counterText(m, text.trim().length, b.maxChars, oneLine ? 'one line' : 'two lines')}
+                      {!edited && (b.facts?.length ?? 0) > 0 ? ` · facts ${b.facts!.join(', ')}` : ''}
+                    </span>
+                  )}
+                  {isV6Draft && !edited && (b.askAishwar?.length ?? 0) > 0 && (
+                    <details style={{ marginTop: 2 }}>
+                      <summary className="sub" style={{ cursor: 'pointer', color: 'var(--warn-text)' }}>
+                        Confirm with Aishwar before this goes out ({b.askAishwar!.length})
+                      </summary>
+                      <ul style={{ margin: '2px 0 0 16px' }}>
+                        {b.askAishwar!.map((q, i) => <li key={i} className="sub">{q}</li>)}
+                      </ul>
+                    </details>
+                  )}
+                  {isV6Draft && !edited && (b.defects?.length ?? 0) > 0 && (
+                    <details style={{ marginTop: 2 }}>
+                      <summary className="sub" style={{ cursor: 'pointer' }}>{b.defects!.length} gate defect{b.defects!.length === 1 ? '' : 's'}</summary>
+                      <ul style={{ margin: '2px 0 0 16px' }}>
+                        {b.defects!.map((d, i) => <li key={i} className="sub">{d}</li>)}
+                      </ul>
+                    </details>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+
+          {/* v6: the 1 pt white keyword block. Parsers read it, readers do not; a
+              recruiter who selects-all in Word will. Prune what Aishwar cannot
+              defend — your list is used verbatim, nothing is re-filled. */}
+          {isV6Draft && editHidden !== null && (
+            <details style={{ marginTop: 10 }} open={violations.some((v) => v.id === 'hidden keywords')}>
+              <summary className="label" style={{ cursor: 'pointer' }}>
+                Hidden keyword block · {editHidden.split(',').map((t) => t.trim()).filter(Boolean).length} terms
+                {result.hiddenKeywords !== undefined && editHidden.trim() !== (result.hiddenKeywords ?? '').trim() ? ' · edited' : ''}
+              </summary>
+              <div className="sub" style={{ margin: '4px 0' }}>
+                Rendered in 1 pt white under the skills lines: ATS keyword matchers parse it, the page shows nothing.
+                Remove anything Aishwar could not speak to in an interview; empty the box to render no hidden block.
+              </div>
+              <textarea
+                rows={4}
+                value={editHidden}
+                onChange={(e) => setEditHidden(e.target.value)}
+                style={{ width: '100%', ...(measured['hidden keywords'] && !measured['hidden keywords'].ok ? OVER : {}) }}
+                placeholder="keyword, keyword, keyword"
+              />
+              <div style={{ marginTop: 4 }}>
+                <button className="btn small" onClick={() => setEditHidden(result.hiddenKeywords ?? '')}>Restore generated list</button>
+              </div>
+            </details>
+          )}
+
+          <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <button
+              className="btn primary"
+              onClick={() => void approve()}
+              disabled={finalizing || (isV6Draft && overLimit.length > 0)}
+              title={isV6Draft && overLimit.length ? overLimit.map((m) => `${m.id}: ${m.message ?? 'over the limit'}`).join('\n') : undefined}
+            >
+              {finalizing ? 'Drafting…' : isV6Draft && overLimit.length
+                ? `Shorten ${overLimit.map((m) => m.id).join(', ')} first`
+                : 'Approve & draft résumé'}
+            </button>
+            <button className="btn" onClick={() => result && beginReview(result)} disabled={finalizing}>
+              Reset edits
+            </button>
+            {isV6Draft && (
+              <span className="sub">
+                Approve re-runs the page model, skills packing and hidden block on your text — the docx renders only when every box fits.
+              </span>
+            )}
+          </div>
+
+          {result.runDir && (
+            <p className="muted" style={{ marginTop: 8 }}>
+              Full run artifacts: <code>{result.runDir}</code>
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* ---- finalized: the approved résumé, viewable and saveable -------- */}
+      {result && !lastDryRun && result.finalized && (
+        <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <strong>Approved résumé</strong>
+            <span className="muted">· {costLabel(result.costUsd)}</span>
+            {result.document && (
+              <>
+                <button className="btn small primary" onClick={() => void save()}>
+                  {result.needsHumanReview ? 'Save anyway →  Documents' : 'Save to Documents'}
+                </button>
+                <button className="btn small" onClick={() => downloadResultDocument(result)}>
+                  View / download .docx
+                </button>
+              </>
+            )}
+          </div>
+
+          {result.document && (
+            <label
+              className="muted"
+              style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 6, cursor: 'pointer' }}
+              title="Documents only auto-star the first résumé you store. Without this, an older résumé stays the one that attaches."
+            >
+              <input
+                type="checkbox"
+                checked={makeDefault}
+                onChange={(e) => setMakeDefault(e.target.checked)}
+              />
+              Make this the résumé that attaches (★)
+            </label>
+          )}
+
+          {result.needsHumanReview && (
+            <div className="note warn" style={{ marginTop: 8 }}>
+              <strong>Still flagged.</strong> {result.reviewReason ?? 'Some unedited pieces did not clear the gate.'}
+              <div className="sub" style={{ marginTop: 4 }}>
+                These are the parts you left as generated — read them before this goes to an employer.
+              </div>
+            </div>
+          )}
+
+          {result.engine === 'v6' && (
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginTop: 8 }}>
+              <span className="chip gray">v6</span>
+              {result.domain && !result.domain.generic && (
+                <span className="chip">lens · {result.domain.name ?? result.domain.slug}{result.domain.subCategory ? ` · ${result.domain.subCategory}` : ''}</span>
+              )}
+              {result.pageFit && (
+                <span className={result.pageFit.fits ? 'chip' : 'chip warn-chip'} style={result.pageFit.fits ? OK_CHIP : undefined}>
+                  {result.pageFit.fits ? 'one page' : 'over one page'}
+                  {result.pageFit.usedPt != null && result.pageFit.availablePt != null
+                    ? ` · ${Math.round(result.pageFit.usedPt)}/${Math.round(result.pageFit.availablePt)} pt` : ''}
+                </span>
+              )}
+              {result.atsScore && (
+                <span className="chip gray">ATS {result.atsScore.parsed ?? '–'} parsed · {result.atsScore.visible ?? '–'} visible</span>
+              )}
+              <span className="chip gray">
+                hidden block · {(result.hiddenKeywords ?? '').split(',').map((t) => t.trim()).filter(Boolean).length} terms
+              </span>
+            </div>
+          )}
+
+          {result.engine === 'v6' && (() => {
+            const questions = Array.from(new Set(result.bullets.flatMap((b) => (b.humanEdited ? [] : b.askAishwar ?? []))))
+            return questions.length ? (
+              <details style={{ marginTop: 8 }}>
+                <summary className="sub" style={{ cursor: 'pointer', color: 'var(--warn-text)' }}>
+                  Confirm with Aishwar before sending — {questions.length} question{questions.length === 1 ? '' : 's'}
+                </summary>
+                <ul style={{ margin: '4px 0 0 16px' }}>
+                  {questions.map((q, i) => <li key={i} className="sub">{q}</li>)}
+                </ul>
+              </details>
+            ) : null
+          })()}
+
+          {result.summary && (
+            <div style={{ marginTop: 10 }}>
+              <div className="label">Professional summary</div>
+              <p style={{ margin: '4px 0 0 0' }}>{result.summary}</p>
+            </div>
+          )}
+
+          {(result.skills?.length ?? 0) > 0 && (
+            <div style={{ marginTop: 10 }}>
+              <div className="label">Technical skills</div>
+              {result.skills!.map((line, i) => (
+                <p key={i} style={{ margin: '4px 0 0 0' }}>
+                  <strong>{line.category}</strong> {line.skills}
+                </p>
+              ))}
+            </div>
+          )}
+
+          <div className="label" style={{ marginTop: 10 }}>Experience bullets</div>
+          <ol style={{ margin: '6px 0 0 18px', padding: 0 }}>
+            {result.bullets.map((b) => (
+              <li key={b.slot} style={{ marginBottom: 6 }}>
+                <span className="sub">[{b.category}]</span>{' '}
+                {b.text}
+                {b.needs_human_review && <span className="warn" title={(b.defects ?? []).join('\n') || undefined}> ⚠</span>}
+                {result.engine === 'v6' && b.humanEdited && <span className="chip gray" style={{ marginLeft: 4 }}>your text</span>}
+                {result.engine === 'v6' && !b.humanEdited && (b.confidence === 'confirm' || b.confidence === 'framing') && (
+                  <span className="chip warn-chip" style={{ marginLeft: 4 }} title={(b.askAishwar ?? []).join('\n')}>ask Aishwar</span>
+                )}
+              </li>
+            ))}
+          </ol>
+
+          {result.runDir && (
+            <p className="muted" style={{ marginTop: 8 }}>
+              Full run artifacts: <code>{result.runDir}</code>
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* ---- cover letter: its own button, its own spend, never auto ------ */}
+      {result && !lastDryRun && (
+        <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <strong>Cover letter</strong>
+            {result.coverLetterStatus !== 'running' && !letterBusy && (
+              <button
+                className="btn small primary"
+                onClick={() => void generateLetter()}
+                disabled={blocked}
+              >
+                {result.coverLetterStatus === 'done'
+                  ? `Regenerate — ~${costLabel(estimateCoverLetterCostUsd())}`
+                  : `Generate cover letter — ~${costLabel(estimateCoverLetterCostUsd())}`}
+              </button>
+            )}
+            {result.coverLetter && (
+              <>
+                <button className="btn small" onClick={() => void copyLetter()}>Copy text</button>
+                {result.coverLetterDocument && (
+                  <>
+                    <button className="btn small" onClick={() => downloadCoverLetterDocument(result)}>
+                      Download .docx
+                    </button>
+                    <button className="btn small" onClick={() => void saveLetter()}>
+                      Save to Documents
+                    </button>
+                  </>
+                )}
+              </>
+            )}
+          </div>
+
+          {!result.coverLetter && result.coverLetterStatus !== 'running' && !letterBusy && (
+            <p className="muted" style={{ marginTop: 6 }}>
+              Reads the posting into the problem this role exists to solve, picks the result on the
+              verified record that looks most like it, and writes five paragraphs — why this company,
+              what he does, the evidence, a hedged reading of the likely constraint, and an invitation
+              to talk about it (10 / 30 / 30 / 20 / 10). Uses the Company Atlas when the employer is in
+              it. The résumé is untouched, and nothing is ever attached automatically.
+            </p>
+          )}
+
+          {(result.coverLetterStatus === 'running' || letterBusy) && (
+            <div className="note" style={{ marginTop: 8 }}>
+              <strong>Writing the cover letter…</strong>
+              <div className="sub">Question set → fact-grounded answers → letter → gate. Under a minute.</div>
+            </div>
+          )}
+
+          {letterStatus && <div className="note" style={{ marginTop: 8 }}>{letterStatus}</div>}
+
+          {result.coverLetterStatus === 'failed' && result.coverLetterError && (
+            <div className="note warn" style={{ marginTop: 8 }}>
+              <strong>Letter generation failed.</strong> {result.coverLetterError}
+            </div>
+          )}
+
+          {result.coverLetter && (
+            <>
+              {result.coverLetter.needsHumanReview && (
+                <div className="note warn" style={{ marginTop: 8 }}>
+                  <strong>The letter gate flagged parts of this draft.</strong>
+                  {(result.coverLetter.defects?.length ?? 0) > 0 && (
+                    <ul style={{ margin: '6px 0 0 16px' }}>
+                      {result.coverLetter.defects!.map((d, i) => <li key={i}>{d}</li>)}
+                    </ul>
+                  )}
+                  <div className="sub" style={{ marginTop: 4 }}>
+                    Read it before sending — copy it out and fix what the gate could not.
+                  </div>
+                </div>
+              )}
+              <div
+                style={{
+                  marginTop: 10, padding: 10, border: '1px solid var(--border)',
+                  borderRadius: 6, whiteSpace: 'pre-wrap',
+                }}
+              >
+                {result.coverLetter.text}
+              </div>
+              {result.coverLetter.mode === 'hypothesis' ? (
+                <div className="sub" style={{ marginTop: 6, display: 'grid', gap: 3 }}>
+                  <span>
+                    {result.coverLetter.wordCount ?? 0} words · problem-hypothesis letter
+                    {result.coverLetter.weights?.length
+                      ? ` · weights ${result.coverLetter.weights.map((w) => `${Math.round(w * 100)}%`).join(' / ')} (target 10/30/30/20/10)`
+                      : ''}
+                  </span>
+                  {result.coverLetter.roleReadsAs && <span>Reading of the role: {result.coverLetter.roleReadsAs}</span>}
+                  {result.coverLetter.hypothesis && <span>Hypothesis offered: {result.coverLetter.hypothesis}</span>}
+                  {result.coverLetter.atlas && <span>Company Atlas: {result.coverLetter.atlas}</span>}
+                  {(result.coverLetter.askAishwar?.length ?? 0) > 0 && (
+                    <details>
+                      <summary style={{ cursor: 'pointer', color: 'var(--warn-text)' }}>
+                        Confirm with Aishwar before sending ({result.coverLetter.askAishwar!.length})
+                      </summary>
+                      <ul style={{ margin: '4px 0 0 16px' }}>
+                        {result.coverLetter.askAishwar!.map((q, i) => <li key={i}>{q}</li>)}
+                      </ul>
+                    </details>
+                  )}
+                  <span>
+                    Diagnosis in <code>{result.runDir ? `${result.runDir}/7_cover_letter_diagnosis.json` : '7_cover_letter_diagnosis.json'}</code>
+                  </span>
+                </div>
+              ) : (
+                <p className="muted" style={{ marginTop: 6 }}>
+                  {result.coverLetter.wordCount ?? 0} words · thinking trace in{' '}
+                  <code>{result.runDir ? `${result.runDir}/7_cover_letter_thinking.json` : '7_cover_letter_thinking.json'}</code>
+                </p>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}

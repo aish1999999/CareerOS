@@ -1,0 +1,1380 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { LEAD_AGE_BRACKET, LEAD_GENDER, type LeadAgeBracket, type LeadGender } from '@contract/entities'
+import {
+  addTargetRole,
+  captureActiveTabProfile,
+  clearOutreachDraft,
+  draftMessage,
+  getOutreachSettings,
+  getTemplates,
+  loadDraftForActiveProfile,
+  recordSent,
+  saveLead,
+  saveOutreachDraft,
+  setOutreachSettings,
+  tightenMessage,
+  type LinkedInProfile,
+  type OutreachTone as StoredTone,
+  type OutreachValues,
+  type StoredOutreachDraft,
+} from '@/lib/outreach'
+import { ServiceConnection } from '@/ui/components/ServiceConnection'
+import { shouldOpen, type ConnectionState } from '@/lib/service-connection'
+
+// ---------------------------------------------------------------------------
+// Stage 8 — the outreach panel. ONE component, mounted twice: as a tab in the
+// popup and as the Chrome side panel. It holds no keys and no LinkedIn code.
+//
+// What it does NOT do, and the reason it is written this way:
+//   * nothing is read from the open LinkedIn page until the human presses
+//     "Read this profile" — the button IS the consent, and the panel says so
+//     before it is pressed;
+//   * nothing is clicked, opened or sent on LinkedIn, ever. The human presses
+//     Send in LinkedIn with their own hand, then presses "I sent it" here;
+//   * the stand-out skill is TYPED (Bob, 2026-09-07). Nothing infers it from
+//     the profile and no model fills it, so no sentence can be put in his
+//     mouth;
+//   * an unknown gender stays unknown. The reader's guess is shown as a guess,
+//     with its reason on the chip, and the human confirms or flips it. A
+//     50/50 coin flip is not a fact and is never rendered as one;
+//   * an over-length note is REFUSED in words, with what to cut, AND a Tighten
+//     button is offered — refusal and rescue, not one or the other. Tighten is
+//     the only thing on this screen that spends, it says so on its own face,
+//     and it asks first.
+//
+// Every reason a message may not be sent comes back from the hub's gate
+// (service/outreach.py check()) — this panel renders those reasons, it never
+// invents or suppresses one, and "I sent it" is dead until the list is empty.
+//
+// The pure half (readers, labels, gates) is exported beside the component so
+// the rules can be tested as plain functions, without a DOM.
+// ---------------------------------------------------------------------------
+
+/** LinkedIn's own cap on an invitation note. The hub holds the same number; this copy is for the
+ *  live character count, which must not need a round trip to turn red. */
+export const MAX_NOTE_CHARS = 300
+
+export const OUTREACH_TONES = ['casual', 'professional'] as const
+export type OutreachTone = (typeof OUTREACH_TONES)[number]
+
+// --- the shapes this panel holds -------------------------------------------
+// Read through the normalisers below rather than trusted from the wire: the hub, the storage layer
+// and the page reader each spell a person slightly differently, and a panel that throws on an
+// unexpected key would strand a human mid-message.
+
+export interface CapturedProfile {
+  linkedinUrl: string
+  fullName: string | null
+  firstName: string | null
+  lastName: string | null
+  headline: string | null
+  company: string | null
+  companyDomain: string | null
+  roleTitle: string | null
+  location: string | null
+  background: string | null
+}
+
+/** A guess about the reader, with the evidence that produced it. `why` is shown on the chip. */
+export interface AxisSuggestion<T extends string> {
+  value: T
+  why: string
+}
+
+export interface OutreachTemplate {
+  key: string
+  bracket: string
+  gender: string
+  tone: string
+  body: string
+  skeletonChars: number
+}
+
+export interface OutreachSettings {
+  tone: OutreachTone
+  targetRole: string
+  targetRoles: string[]
+  skillset: string
+}
+
+/** One reason the message may not be sent, and what to do about it. Never a rewrite. */
+export interface OutreachReason {
+  code: string
+  detail: string
+  fix: string
+}
+
+/** The hub's verdict on a message — whether it was filled from a template or typed by hand. */
+export interface DraftGate {
+  ok: boolean
+  text: string
+  chars: number
+  templateKey: string | null
+  reasons: OutreachReason[]
+  costUsd: number | null
+}
+
+/** The five slots every template carries (service/outreach.py FIELDS). */
+export interface DraftValues {
+  name: string
+  standoutSkill: string
+  company: string
+  skillset: string
+  targetRole: string
+}
+
+// --- normalisers: tolerant readers, all pure -------------------------------
+
+function asRecord(raw: unknown): Record<string, unknown> | null {
+  return raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : null
+}
+
+function pickString(source: Record<string, unknown>, ...keys: string[]): string | null {
+  for (const key of keys) {
+    const value = source[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return null
+}
+
+/**
+ * The person as the page reader saw them. Accepts camelCase or the contract's snake_case, and
+ * unwraps a `{ profile: … }` envelope, because the reader and this panel are written apart.
+ * Returns null when there is nothing person-shaped there — the panel then says so rather than
+ * showing an empty card that looks like a read.
+ */
+export function readProfile(raw: unknown): CapturedProfile | null {
+  const outer = asRecord(raw)
+  if (!outer) return null
+  const source = asRecord(outer.profile) ?? outer
+  const fullName = pickString(source, 'fullName', 'full_name', 'name')
+  const firstName = pickString(source, 'firstName', 'first_name')
+  const linkedinUrl = pickString(source, 'linkedinUrl', 'linkedin_url', 'profileUrl', 'url') ?? ''
+  if (!linkedinUrl && !fullName && !firstName) return null
+  return {
+    linkedinUrl,
+    fullName,
+    firstName: firstName ?? (fullName ? fullName.split(/\s+/)[0] : null),
+    lastName: pickString(source, 'lastName', 'last_name')
+      ?? (fullName && fullName.split(/\s+/).length > 1 ? fullName.split(/\s+/).slice(-1)[0] : null),
+    headline: pickString(source, 'headline', 'title'),
+    company: pickString(source, 'company', 'companyName', 'company_name', 'currentCompany'),
+    companyDomain: pickString(source, 'companyDomain', 'company_domain', 'domain'),
+    roleTitle: pickString(source, 'roleTitle', 'role_title', 'jobTitle', 'position'),
+    location: pickString(source, 'location'),
+    background: pickString(source, 'background', 'about', 'summary'),
+  }
+}
+
+const AGE_ALIASES: Record<string, string> = {
+  '20': '20s', '30': '30s', '40': '40s', '50': '50s', '60': '60s',
+  twenties: '20s', thirties: '30s', forties: '40s', fifties: '50s', sixties: '60s',
+}
+const GENDER_ALIASES: Record<string, string> = {
+  male: 'm', man: 'm', men: 'm', he: 'm',
+  female: 'f', woman: 'f', women: 'f', she: 'f',
+}
+
+/**
+ * A suggestion from the page reader, reduced to a value this contract allows plus the reason it
+ * was reached. Anything unreadable becomes the fallback — `unknown` — with a `why` that says the
+ * profile did not tell us. A guess is never upgraded to a fact on the way through here.
+ */
+export function readSuggestion<T extends string>(
+  raw: unknown,
+  allowed: readonly T[],
+  fallback: T,
+  aliases: Record<string, string> = {},
+): AxisSuggestion<T> {
+  const source = asRecord(raw)
+  const rawValue = typeof raw === 'string'
+    ? raw
+    : source
+      ? pickString(source, 'value', 'bracket', 'ageBracket', 'age_bracket', 'gender')
+      : null
+  const normalised = rawValue ? (aliases[rawValue.toLowerCase()] ?? rawValue.toLowerCase()) : null
+  const value = allowed.find((option) => option === normalised) ?? fallback
+  const why = (source ? pickString(source, 'why', 'reason', 'evidence') : null)
+    ?? (value === fallback
+      ? 'The profile did not say, so this is left unknown — nothing is guessed for you.'
+      : 'The reader gave no reason for this.')
+  return { value, why }
+}
+
+/** The 20 notes as the hub serves them. A malformed entry is dropped, never repaired. */
+export function readTemplates(raw: unknown): OutreachTemplate[] {
+  const list = Array.isArray(raw) ? raw : (asRecord(raw)?.templates as unknown)
+  if (!Array.isArray(list)) return []
+  const out: OutreachTemplate[] = []
+  for (const entry of list) {
+    const source = asRecord(entry)
+    if (!source) continue
+    const key = pickString(source, 'key')
+    const bracket = pickString(source, 'bracket')
+    const gender = pickString(source, 'gender')
+    const tone = pickString(source, 'tone')
+    const body = pickString(source, 'body')
+    if (!key || !bracket || !gender || !tone || !body) continue
+    const skeleton = source.skeletonChars
+    out.push({ key, bracket, gender, tone, body, skeletonChars: typeof skeleton === 'number' ? skeleton : body.length })
+  }
+  return out
+}
+
+export const EMPTY_SETTINGS: OutreachSettings = { tone: 'casual', targetRole: '', targetRoles: [], skillset: '' }
+
+/** The remembered target roles, skillset and tone. Unknown values fall back rather than throw. */
+export function readSettings(raw: unknown): OutreachSettings {
+  const source = asRecord(raw)
+  if (!source) return { ...EMPTY_SETTINGS }
+  const toneRaw = pickString(source, 'tone')
+  const tone = OUTREACH_TONES.find((t) => t === toneRaw) ?? 'casual'
+  const rolesRaw = source.targetRoles ?? source.target_roles ?? source.roles
+  const roles: string[] = []
+  if (Array.isArray(rolesRaw)) {
+    for (const role of rolesRaw) {
+      if (typeof role === 'string' && role.trim() && !roles.includes(role.trim())) roles.push(role.trim())
+    }
+  }
+  // `lastTargetRole` is what lib/outreach.ts stores; `targetRole` is accepted too so a panel state
+  // object round-trips through here unchanged. Reading only the latter is why the picker used to
+  // reset on every open.
+  const targetRole = pickString(source, 'lastTargetRole', 'last_target_role', 'targetRole', 'target_role') ?? ''
+  if (targetRole && !roles.includes(targetRole)) roles.unshift(targetRole)
+  return { tone, targetRole, targetRoles: roles, skillset: pickString(source, 'skillset') ?? '' }
+}
+
+/** The lead id out of whatever saveLead resolved to — an id, a lead, or an envelope around one. */
+export function readLeadId(raw: unknown): string | null {
+  if (typeof raw === 'string') return raw.trim() || null
+  const source = asRecord(raw)
+  if (!source) return null
+  const direct = pickString(source, 'id', 'leadId', 'lead_id')
+  if (direct) return direct
+  const nested = asRecord(source.lead)
+  return nested ? pickString(nested, 'id') : null
+}
+
+/** The hub's gate result. `fallbackText` keeps the human's own words on screen when the hub
+ *  answered without echoing them back. */
+export function readGate(raw: unknown, fallbackText = ''): DraftGate {
+  const outer = asRecord(raw) ?? {}
+  // The lib answers in an envelope — `{status, note, draft}` from draftMessage, `{…, result}` from
+  // tightenMessage — and the gate is inside it. Reading the envelope as though it were the gate
+  // loses every refusal the hub sent, which would let a note the 300-character rule (or a banned
+  // phrase, or the verb rule) rejected reach the "I sent it" button. Unwrap first, always.
+  const source = asRecord(outer.draft) ?? asRecord(outer.result) ?? asRecord(outer.gate) ?? outer
+  const reasons: OutreachReason[] = []
+  if (Array.isArray(source.reasons)) {
+    for (const entry of source.reasons) {
+      const reason = asRecord(entry)
+      if (!reason) continue
+      reasons.push({
+        code: pickString(reason, 'code') ?? 'refused',
+        detail: pickString(reason, 'detail') ?? 'the hub refused this message',
+        fix: pickString(reason, 'fix') ?? 'edit the message and it will be checked again',
+      })
+    }
+  }
+  const text = pickString(source, 'text') ?? fallbackText
+  const chars = typeof source.chars === 'number' ? source.chars : text.length
+  const cost = source.costUsd
+  return {
+    ok: source.ok === true && reasons.length === 0,
+    text,
+    chars,
+    templateKey: pickString(source, 'templateKey', 'template_key'),
+    reasons,
+    costUsd: typeof cost === 'number' ? cost : null,
+  }
+}
+
+// --- the rules, as plain functions -----------------------------------------
+
+export interface CharCount {
+  chars: number
+  over: number
+  overLimit: boolean
+  color: string
+  label: string
+}
+
+/** The live count under the textarea. Red past 300 — LinkedIn will not take the 301st character. */
+export function charCount(text: string): CharCount {
+  const chars = text.length
+  const over = chars - MAX_NOTE_CHARS
+  const overLimit = over > 0
+  return {
+    chars,
+    over: overLimit ? over : 0,
+    overLimit,
+    color: overLimit ? 'var(--danger)' : 'var(--muted)',
+    label: overLimit
+      ? `${chars} / ${MAX_NOTE_CHARS} — ${over} over`
+      : `${chars} / ${MAX_NOTE_CHARS}`,
+  }
+}
+
+const AGE_LABELS: Record<LeadAgeBracket, string> = {
+  '20s': 'in their 20s',
+  '30s': 'in their 30s',
+  '40s': 'in their 40s',
+  '50s': 'in their 50s',
+  '60s': 'in their 60s',
+  unknown: 'unknown — pick one',
+}
+
+const GENDER_LABELS: Record<LeadGender, string> = {
+  m: 'male',
+  f: 'female',
+  unknown: 'unknown — not guessed',
+}
+
+export function ageChipLabel(bracket: LeadAgeBracket): string {
+  return AGE_LABELS[bracket] ?? String(bracket)
+}
+
+export function genderChipLabel(gender: LeadGender): string {
+  return GENDER_LABELS[gender] ?? String(gender)
+}
+
+/** Selected chips read as chosen; the rest stay grey. `unknown`, chosen, is a warning — it has no
+ *  template behind it. No class here is invented: styles.css defines chip / gray / warn-chip. */
+export function chipClassFor(value: string, current: string): string {
+  if (value !== current) return 'chip gray'
+  return value === 'unknown' ? 'chip warn-chip' : 'chip'
+}
+
+/** What the chip says on hover: the reader's own reason on the suggested value, and on every other
+ *  chip the plain fact that pressing it is the human's call, not the reader's. */
+export function chipTitleFor(
+  value: string,
+  suggestion: { value: string; why: string } | null,
+  confirmed: boolean,
+): string {
+  if (suggestion && suggestion.value === value) {
+    return confirmed
+      ? `You confirmed this. The profile suggested it: ${suggestion.why}`
+      : `Suggested from the profile — a guess until you press it: ${suggestion.why}`
+  }
+  return 'Not what the profile suggested. Pressing this is your call, and it overrides the guess.'
+}
+
+/** Everything the note still needs before the hub can fill a template. Sentences, not codes: this
+ *  list is shown to a human who has to act on it. */
+export function missingBeforeDraft(
+  values: DraftValues,
+  bracket: LeadAgeBracket,
+  gender: LeadGender,
+): string[] {
+  const missing: string[] = []
+  if (bracket === 'unknown') missing.push('the age bracket — the register of the note depends on it')
+  if (gender === 'unknown') missing.push('the gender — the 20 notes are written per reader, and unknown has no note')
+  if (!values.name.trim()) missing.push("the person's name — read the profile again, or the note will say [Name]")
+  // The adapter often cannot read a company off a LinkedIn profile — the markup varies and the
+  // current employer is not always stated. So this is a field you type, prefilled when the page
+  // did say. Telling you to "read the profile again" was a dead end whenever it simply is not there.
+  if (!values.company.trim()) missing.push("their company — you type this one; the profile does not always say")
+  if (!values.standoutSkill.trim()) missing.push('the stand-out skill — you type this one; nothing infers it')
+  if (!values.targetRole.trim()) missing.push('your target role — pick one, or add a new one')
+  if (!values.skillset.trim()) missing.push('your skillset')
+  return missing
+}
+
+/**
+ * What the company box holds after a read. The box is yours to type — the adapter often finds no
+ * employer on a profile — so a read only ever PREFILLS it:
+ *
+ *   the page named one            → take it, it is fresher than anything typed
+ *   it did not, same person again → keep what you typed; re-reading must not wipe the box you
+ *                                   filled precisely because the reader could not
+ *   it did not, someone else      → clear it; one person's employer must never ride onto another
+ *
+ * A profile with no URL counts as someone else: there is nothing to match people on.
+ */
+export function companyAfterRead(
+  previous: { linkedinUrl: string } | null,
+  typed: string,
+  incoming: { linkedinUrl: string; company: string | null },
+): string {
+  if (incoming.company) return incoming.company
+  const samePerson = previous !== null && incoming.linkedinUrl !== '' && previous.linkedinUrl === incoming.linkedinUrl
+  return samePerson ? typed : ''
+}
+
+export interface GenerateState {
+  enabled: boolean
+  /** Shown on the button's tooltip, and beside it when it is disabled. Always says why. */
+  why: string
+  /** Pressing it would replace words the human wrote, so the panel asks before it does. */
+  overwrites: boolean
+}
+
+/**
+ * Whether the note can be generated, and what to say when it cannot. Every disabled reason names
+ * the thing to go and fix — a greyed-out button with no explanation is the same dead end the empty
+ * note box used to be.
+ *
+ * The two chips must be CONFIRMED, not merely suggested: the bank is 20 notes written per reader,
+ * so a guessed bracket or gender picks the note without anyone having agreed to it.
+ */
+export function generateState(input: {
+  missing: string[]
+  ageConfirmed: boolean
+  genderConfirmed: boolean
+  hasTemplate: boolean
+  busy: boolean
+  edited: boolean
+  text: string
+}): GenerateState {
+  const off = (why: string): GenerateState => ({ enabled: false, why, overwrites: false })
+  if (input.busy) return off('Working — wait for the current step to finish.')
+  if (input.missing.length > 0) return off(`It still needs: ${input.missing.join('; ')}.`)
+  if (!input.ageConfirmed || !input.genderConfirmed) {
+    const which = !input.ageConfirmed && !input.genderConfirmed ? 'age bracket and gender chips'
+      : !input.ageConfirmed ? 'age bracket chip' : 'gender chip'
+    return off(`Press the ${which} to confirm — the 20 notes are written per reader, so a guess `
+      + 'must not pick one on your behalf.')
+  }
+  if (!input.hasTemplate) {
+    return off('No template for this bracket / gender / tone. Change the tone, or check data/outreach in the hub.')
+  }
+  const overwrites = input.edited && input.text.trim() !== ''
+  return {
+    enabled: true,
+    overwrites,
+    why: overwrites
+      ? 'Replaces the note you edited with a fresh one from the fields above. It asks first.'
+      : 'Fills the template from the fields above. Costs nothing.',
+  }
+}
+
+/** Tighten is the only spend on this screen, so it is offered only where it can help: an
+ *  over-length note. Everything else is the human's own editing. */
+export function tightenState(chars: number, busy: boolean): { enabled: boolean; why: string } {
+  if (busy) return { enabled: false, why: 'Working — wait for the current step to finish.' }
+  if (chars <= MAX_NOTE_CHARS) {
+    return { enabled: false, why: `Nothing to pay for: the note is within ${MAX_NOTE_CHARS} characters.` }
+  }
+  return {
+    enabled: true,
+    why: `Spends money: one short model call shortens this to ${MAX_NOTE_CHARS} characters. `
+      + 'It asks before it spends, keeps your draft either way, and the result goes through the same checks.',
+  }
+}
+
+export interface SendState {
+  text: string
+  checked: boolean
+  reasons: OutreachReason[]
+  linkedinUrl: string
+  busy: boolean
+  sentAt: string | null
+}
+
+/** Every reason "I sent it" is dead. Empty means it is alive. The button is never enabled on an
+ *  unchecked message: if the hub could not be reached, the message was not gated, and an ungated
+ *  send is exactly the silent fallback this project refuses. */
+export function sendBlockers(state: SendState): string[] {
+  const blockers: string[] = []
+  if (state.sentAt) blockers.push('this note is already logged as sent')
+  if (!state.text.trim()) blockers.push('there is no message yet')
+  if (!state.linkedinUrl.trim()) blockers.push("no LinkedIn URL was read — press Read this profile on the person's page")
+  if (!state.checked) blockers.push('the hub has not checked this message yet')
+  for (const reason of state.reasons) blockers.push(`${reason.detail} — ${reason.fix}`)
+  if (state.busy) blockers.push('working…')
+  return blockers
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+// --- the pure form ----------------------------------------------------------
+
+export interface OutreachFormProps {
+  profile: CapturedProfile | null
+  ageSuggestion: AxisSuggestion<LeadAgeBracket> | null
+  genderSuggestion: AxisSuggestion<LeadGender> | null
+  bracket: LeadAgeBracket
+  gender: LeadGender
+  ageConfirmed: boolean
+  genderConfirmed: boolean
+  values: DraftValues
+  targetRoles: string[]
+  newRole: string
+  tone: OutreachTone
+  /** The drafted message, as it should appear on the page. There is no editable box any more,
+   *  so this is the single thing the panel shows, counts, copies and sends. */
+  note: string
+  gate: DraftGate | null
+  templateKey: string | null
+  hasTemplate: boolean
+  missing: string[]
+  blockers: string[]
+  tighten: { enabled: boolean; why: string }
+  generate: GenerateState
+  count: CharCount
+  reading: boolean
+  drafting: boolean
+  tightening: boolean
+  sending: boolean
+  sentAt: string | null
+  status: string | null
+  /** One line of truth about the last Generate press or restore re-check: what the hub returned,
+   *  before the panel touched it. Present only after one has run. */
+  wire: string | null
+  /** A restored note being gated again. Never `drafting` — that would relabel the Generate button
+   *  when nothing is being generated. */
+  rechecking: boolean
+  /** True once the hub has judged what is on screen. "I sent it" waits on it. */
+  checked: boolean
+  connection: ConnectionState
+  connectionOpen: boolean
+  on: {
+    read: () => void
+    chooseBracket: (bracket: LeadAgeBracket) => void
+    chooseGender: (gender: LeadGender) => void
+    setCompany: (value: string) => void
+    setStandoutSkill: (value: string) => void
+    setTargetRole: (value: string) => void
+    setNewRole: (value: string) => void
+    addRole: () => void
+    setSkillset: (value: string) => void
+    setTone: (tone: OutreachTone) => void
+    generate: () => void
+    recheck: () => void
+    setConnectionOpen: (open: boolean) => void
+    setConnection: (state: ConnectionState) => void
+    tighten: () => void
+    copy: () => void
+    send: () => void
+  }
+}
+
+/**
+ * Everything the panel shows, with nothing of its own to fetch or remember. The container below
+ * owns the state; this half can be rendered from fixtures.
+ */
+export function OutreachForm(props: OutreachFormProps) {
+  const { profile, values, count, gate, on } = props
+  const busy = props.reading || props.drafting || props.tightening || props.sending
+  const person = profile?.fullName ?? profile?.firstName ?? 'this person'
+
+  return (
+    <div data-testid="outreach-panel">
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <strong>LinkedIn outreach</strong>
+        <span className="chip gray" title="Nothing here opens, watches, clicks or sends anything on LinkedIn.">
+          you send it, we log it
+        </span>
+      </div>
+
+      {/* ---- 1. consent: nothing is read until this is pressed ------------- */}
+      {/* The hub connection, here because the side panel has no Tailor tab and every button below
+          is dead until this is right. Collapsed when the token is proven; it opens itself otherwise. */}
+      <ServiceConnection
+        open={props.connectionOpen}
+        onOpenChange={on.setConnectionOpen}
+        state={props.connection}
+        onChange={on.setConnection}
+      />
+
+      <div className="btn-row">
+        <button className="btn small primary" disabled={busy} onClick={on.read}
+          title="Reads the LinkedIn profile in the active tab once. It clicks nothing and sends nothing.">
+          {props.reading ? 'Reading…' : profile ? 'Read this profile again' : 'Read this profile'}
+        </button>
+      </div>
+      <div className="sub">
+        Nothing is read from LinkedIn until you press this, and nothing on LinkedIn is ever clicked or
+        sent by this extension. You press Send in LinkedIn yourself.
+      </div>
+
+      {/* ---- 2. the person as read, with the two guesses as chips ---------- */}
+      {profile && (
+        <div className="note" style={{ marginTop: 8 }}>
+          <div><strong>{person}</strong>{profile.roleTitle ? ` · ${profile.roleTitle}` : ''}</div>
+          {profile.headline && <div className="sub">{profile.headline}</div>}
+          <div className="sub">
+            {/* the box below, not the reader — otherwise this line says "no company read" while
+                the field you typed sits underneath it saying otherwise */}
+            {values.company.trim() || 'no company read — type it below'}
+            {profile.location ? ` · ${profile.location}` : ''}
+            {profile.linkedinUrl ? ` · ${profile.linkedinUrl}` : ' · no profile URL read'}
+          </div>
+
+          <div className="sub" style={{ marginTop: 6 }}>
+            Age bracket {props.ageConfirmed ? '(you confirmed)' : '(a guess — confirm or flip it)'}
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 2 }}>
+            {LEAD_AGE_BRACKET.map((option) => (
+              <button key={option} type="button" style={{ cursor: 'pointer' }}
+                className={chipClassFor(option, props.bracket)}
+                title={chipTitleFor(option, props.ageSuggestion, props.ageConfirmed)}
+                onClick={() => on.chooseBracket(option)}>
+                {ageChipLabel(option)}
+              </button>
+            ))}
+          </div>
+
+          <div className="sub" style={{ marginTop: 6 }}>
+            Gender {props.genderConfirmed ? '(you confirmed)' : '(a guess — confirm or flip it)'}
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 2 }}>
+            {LEAD_GENDER.map((option) => (
+              <button key={option} type="button" style={{ cursor: 'pointer' }}
+                className={chipClassFor(option, props.gender)}
+                title={chipTitleFor(option, props.genderSuggestion, props.genderConfirmed)}
+                onClick={() => on.chooseGender(option)}>
+                {genderChipLabel(option)}
+              </button>
+            ))}
+          </div>
+          {props.gender === 'unknown' && (
+            <div className="sub">
+              Unknown is an honest answer, not a coin flip — but the 20 notes are written per reader,
+              so there is no note to fill until you say which one this is.
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ---- 3. what the human types --------------------------------------- */}
+      <div className="field" style={{ marginTop: 10 }}>
+        <label>Their company (you type this)</label>
+        <input type="text" value={values.company} placeholder="where they work"
+          onChange={(e) => on.setCompany(e.target.value)} />
+        <div className="sub">
+          Filled in from the profile when the page says so, and often it does not — the current
+          employer is not always stated where a reader can find it. Whatever is in this box is what
+          goes into the note and into the lead.
+        </div>
+      </div>
+
+      <div className="field">
+        <label>Stand-out skill (you type this)</label>
+        <input type="text" value={values.standoutSkill} placeholder="the one thing you would say about them"
+          onChange={(e) => on.setStandoutSkill(e.target.value)} />
+        <div className="sub">
+          Nothing infers this. No model fills it, and it is never read off their profile — it is the
+          sentence you would say out loud, so you write it.
+        </div>
+      </div>
+
+      <div className="field">
+        <label>Your target role</label>
+        <select value={values.targetRole} onChange={(e) => on.setTargetRole(e.target.value)}>
+          <option value="">— pick one —</option>
+          {props.targetRoles.map((role) => <option key={role} value={role}>{role}</option>)}
+        </select>
+      </div>
+      <div className="field">
+        <div className="row">
+          <input type="text" value={props.newRole} placeholder="add a role to the list"
+            onChange={(e) => on.setNewRole(e.target.value)} />
+          <button className="btn small" disabled={busy || !props.newRole.trim()} onClick={on.addRole}
+            title="Remembered for next time, on this machine.">
+            Add role
+          </button>
+        </div>
+      </div>
+
+      <div className="field" style={{ marginTop: 10 }}>
+        <label>Your skillset</label>
+        <input type="text" value={values.skillset} placeholder="what you do, in the words you want in the note"
+          onChange={(e) => on.setSkillset(e.target.value)} />
+        <div className="sub">Saved, so you type it once.</div>
+      </div>
+
+      <div className="field">
+        <label>Tone</label>
+        <select value={props.tone} onChange={(e) => on.setTone(e.target.value as OutreachTone)}>
+          {OUTREACH_TONES.map((tone) => <option key={tone} value={tone}>{tone}</option>)}
+        </select>
+      </div>
+
+      {/* ---- 4. the draft, freely editable --------------------------------- */}
+      {props.missing.length > 0 && !props.note.trim() && (
+        <div className="warn">
+          <strong>No note yet.</strong> It still needs:
+          <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
+            {props.missing.map((item) => <li key={item}>{item}</li>)}
+          </ul>
+        </div>
+      )}
+      {profile && props.missing.length === 0 && !props.hasTemplate && (
+        <div className="warn">
+          No template for {props.bracket} / {genderChipLabel(props.gender)} / {props.tone} — the bank has
+          20 notes and this combination is not one of them. Change the tone, or check
+          data/outreach in the hub.
+        </div>
+      )}
+
+      {/* The one control that writes the note. Nothing drafts on its own any more: when the hub
+          could not answer, an automatic draft had nowhere to say so and just left the box empty. */}
+      <div style={{ marginTop: 10 }}>
+        <button className="btn primary" data-testid="outreach-generate"
+          disabled={!props.generate.enabled} onClick={on.generate} title={props.generate.why}>
+          {props.drafting ? 'Generating…' : props.note.trim() ? 'Generate message again' : 'Generate message'}
+        </button>
+        <div className="sub">{props.generate.why}</div>
+      </div>
+
+
+      {/* ---- 4. the note itself, ON THE PAGE ------------------------------
+          There is no textarea here any more (Bob, 2026-09-07: "remove the textbox completely,
+          draft the message in the outreach tab itself"). A controlled <textarea value={…}> was
+          showing empty in the live popup with the draft demonstrably in hand, and after three
+          traces and a passing end-to-end test found nothing wrong with the code, the box itself
+          was the only thing left between him and his message. So the note is rendered as text.
+          `props.note` is the drafted message from whichever source holds it (the container
+          prefers its own state and falls back to the hub's gate), so no single state slot can
+          swallow it again. */}
+      <div style={{ marginTop: 10 }}>
+        <label className="label">
+          The note {props.templateKey ? `· template ${props.templateKey}` : ''}
+        </label>
+        {props.note.trim() ? (
+          <div className="note" data-testid="outreach-note"
+            style={{ whiteSpace: 'pre-wrap', marginTop: 4, userSelect: 'text', lineHeight: 1.45 }}>
+            {props.note}
+          </div>
+        ) : (
+          <div className="note muted" data-testid="outreach-note-empty" style={{ marginTop: 4 }}>
+            {props.drafting
+              ? 'Generating…'
+              : 'No message yet. Fill the fields above and press Generate message.'}
+          </div>
+        )}
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginTop: 4 }}>
+          <span style={{ color: count.color, fontWeight: count.overLimit ? 700 : 400, fontSize: 12 }}
+            data-testid="outreach-count">
+            {count.label}
+          </span>
+          {props.drafting && <span className="sub">checking…</span>}
+          {props.rechecking && (
+            <span className="sub" data-testid="outreach-rechecking">
+              re-checking your restored note with the hub…
+            </span>
+          )}
+        </div>
+        {props.note.trim() && (
+          <div className="sub">
+            Select it here and copy, or press <strong>Copy</strong>. To change the wording, change a
+            field above and press <strong>Generate message again</strong> — the hub writes it, and
+            every rule it must pass is checked there.
+          </div>
+        )}
+      </div>
+
+      {/* the refusal, in words, with what to cut — the panel never edits the note itself */}
+      {gate && gate.reasons.length > 0 && (
+        <div className="warn" data-testid="outreach-reasons">
+          <strong>Not sendable as written:</strong>
+          <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
+            {gate.reasons.map((reason, i) => (
+              <li key={`${reason.code}-${i}`}>{reason.detail} — <em>{reason.fix}</em></li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {gate && gate.ok && (
+        <div className="sub">Passes every check. Send it in LinkedIn yourself, then press I sent it.</div>
+      )}
+
+      {/* ---- 5. the three buttons ------------------------------------------ */}
+      <div className="btn-row">
+        <button className="btn small" disabled={!props.tighten.enabled} onClick={on.tighten} title={props.tighten.why}>
+          {props.tightening ? 'Tightening…' : 'Tighten (spends money)'}
+        </button>
+        <button className="btn small" data-testid="outreach-recheck"
+          disabled={!props.note.trim() || props.checked || busy} onClick={on.recheck}
+          title="Asks the hub to check this note again, exactly as it stands. Costs nothing.">
+          {props.rechecking ? 'Checking…' : 'Check this note'}
+        </button>
+        <button className="btn small" disabled={!props.note.trim()} onClick={on.copy}
+          title="Copies the note so you can paste it into LinkedIn yourself.">
+          Copy
+        </button>
+        <span style={{ flex: 1 }} />
+        <button className="btn small primary" disabled={props.blockers.length > 0} onClick={on.send}
+          data-testid="outreach-sent"
+          title={props.blockers.length > 0
+            ? `Not yet: ${props.blockers.join('; ')}`
+            : 'Records this note as sent. It asks LinkedIn nothing — press it after you pressed Send there.'}>
+          {props.sending ? 'Logging…' : props.sentAt ? 'Logged as sent' : 'I sent it'}
+        </button>
+      </div>
+      {props.blockers.length > 0 && !props.sentAt && (
+        <div className="sub" data-testid="outreach-blockers">Not sendable yet: {props.blockers[0]}</div>
+      )}
+      <div className="sub">
+        Nothing here watches LinkedIn. This button is the only thing that records a send, and it
+        records what you tell it.
+      </div>
+      {props.status && <div className="sub" data-testid="outreach-status">{props.status}</div>}
+      {props.wire && (
+        <div className="sub" data-testid="outreach-wire"
+          style={{ marginTop: 6, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', fontSize: 11, opacity: 0.75, wordBreak: 'break-all' }}>
+          hub said → {props.wire}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// --- the container ----------------------------------------------------------
+
+/**
+ * The stateful half: reads the profile on demand, drafts through the hub on every change (free),
+ * spends only on Tighten, and writes the lead + message only when the human presses I sent it.
+ *
+ * `jobId` is the optional posting that prompted the outreach — the contract's `leads.job_id`, a
+ * pointer and nothing more.
+ */
+export function OutreachPanel({ jobId = null }: { jobId?: string | null } = {}) {
+  const [profile, setProfile] = useState<CapturedProfile | null>(null)
+  const [ageSuggestion, setAgeSuggestion] = useState<AxisSuggestion<LeadAgeBracket> | null>(null)
+  const [genderSuggestion, setGenderSuggestion] = useState<AxisSuggestion<LeadGender> | null>(null)
+  const [bracket, setBracket] = useState<LeadAgeBracket>('unknown')
+  const [gender, setGender] = useState<LeadGender>('unknown')
+  const [ageConfirmed, setAgeConfirmed] = useState(false)
+  const [genderConfirmed, setGenderConfirmed] = useState(false)
+
+  const [templates, setTemplates] = useState<OutreachTemplate[]>([])
+  const [settings, setSettings] = useState<OutreachSettings>({ ...EMPTY_SETTINGS })
+  // Typed, not read: the adapter frequently finds no company on a profile. A read prefills it when
+  // the page does say (see `read` below), and what is in this box is what reaches the note and the
+  // lead — the profile's own value is never used behind it.
+  const [company, setCompany] = useState('')
+  const [standoutSkill, setStandoutSkill] = useState('')
+  const [newRole, setNewRole] = useState('')
+
+  const [text, setText] = useState('')
+  const [gate, setGate] = useState<DraftGate | null>(null)
+  const [checked, setChecked] = useState(false)
+
+  const [reading, setReading] = useState(false)
+  const [drafting, setDrafting] = useState(false)
+  const [tightening, setTightening] = useState(false)
+  const [sending, setSending] = useState(false)
+  const [sentAt, setSentAt] = useState<string | null>(null)
+  const [status, setStatus] = useState<string | null>(null)
+  // What the last Generate press ACTUALLY got back, recorded before any other state is touched and
+  // shown on the page. Bob, 2026-09-07: "where does the message reside? the problem arises at the
+  // retrieval". It resides in the HTTP response and nowhere else, so this is that response, in
+  // words, on screen — no console needed to tell "the hub sent nothing" from "the panel lost it".
+  const [wire, setWire] = useState<string | null>(null)
+  const [rechecking, setRechecking] = useState(false)
+  const [connection, setConnection] = useState<ConnectionState>({ kind: 'unknown' })
+  const [connClosed, setConnClosed] = useState(false)
+
+  // Last gate wins: a slow answer to an old keystroke must never overwrite a newer one.
+  const draftSeq = useRef(0)
+  // The template the current note came from, kept across hand edits so the messages row can say
+  // which of the 20 notes this was.
+  const templateKeyRef = useRef<string | null>(null)
+  // The person exactly as lib/outreach.ts read them. The panel renders a reduced view
+  // (CapturedProfile) and keeps the two suggestions apart, but the store — like saveLead — needs the
+  // whole thing, and `send` reads every field of it.
+  const capturedRef = useRef<LinkedInProfile | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    void (async () => {
+      try {
+        const [loadedSettings, loadedTemplates] = await Promise.all([getOutreachSettings(), getTemplates()])
+        if (!alive) return
+        setSettings(readSettings(loadedSettings))
+        setTemplates(readTemplates(loadedTemplates))
+        // Templates arriving IS proof the token works — /outreach/templates is the same
+        // authenticated route the connection probe would use. So no extra request is made here.
+        setConnection({ kind: 'ok', address: '', health: null })
+      } catch (e) {
+        if (alive) {
+          setStatus(`The template bank could not be read — ${errorText(e)}. Nothing was drafted.`)
+          setConnClosed(false)                       // something is wrong: show him the fix
+        }
+      }
+    })()
+    return () => { alive = false }
+  }, [])
+
+  const values: DraftValues = useMemo(() => ({
+    name: profile?.firstName ?? profile?.fullName ?? '',
+    standoutSkill,
+    company,
+    skillset: settings.skillset,
+    targetRole: settings.targetRole,
+  }), [profile, standoutSkill, company, settings.skillset, settings.targetRole])
+
+  const missing = useMemo(() => missingBeforeDraft(values, bracket, gender), [values, bracket, gender])
+  const hasTemplate = useMemo(
+    () => templates.length === 0
+      || templates.some((t) => t.bracket === bracket && t.gender === gender && t.tone === settings.tone),
+    [templates, bracket, gender, settings.tone],
+  )
+
+  // Compose: fill the template through the hub whenever the inputs are complete and the human has
+  // not taken the pen. Free — service/outreach.py draft() spends nothing.
+  /**
+   * Fill the template into the note box. This runs ONLY when Generate message is pressed (Bob,
+   * 2026-09-07): the panel used to draft by itself 250 ms after the last field was filled, which
+   * meant that when the call failed there was nothing on screen to explain why — just an empty box.
+   * An explicit press has somewhere to put the answer, including the bad one.
+   */
+  const generate = async () => {
+    // The person THIS press is about, whatever is read while it is in flight. Without the snapshot
+    // a "Read this profile" landing mid-call could file this note under the next person.
+    const subject = capturedRef.current
+    const seq = ++draftSeq.current
+    setDrafting(true)
+    setStatus(null)
+    try {
+      const outcome = await draftMessage({ bracket, gender, tone: settings.tone, values })
+      if (seq !== draftSeq.current) return
+      // FIRST, before any branch: what came back. A later `return` must not be able to hide it.
+      setWire(`status=${outcome.status} · textLength=${outcome.draft?.text?.length ?? 0}`
+        + ` · templateKey=${outcome.draft?.templateKey ?? 'none'}`
+        + ` · reasons=${outcome.draft?.reasons?.length ?? 0} · note="${outcome.note}"`)
+      // draftMessage RESOLVES on failure with {status:'error', note, draft:null} — it does not
+      // throw. Reading straight through to readGate here is what emptied the box in silence: the
+      // envelope carries no text, so the note became '' and the reason was thrown away.
+      if (outcome.status !== 'sent' || !outcome.draft) {
+        setChecked(false)
+        setGate(null)
+        setStatus(`${outcome.note} Nothing was written into the note.`)
+        setConnClosed(false)          // whatever went wrong, the fix for it is one block up
+        return
+      }
+      const result = readGate(outcome)
+      // Breadcrumb, house style: what came back and what is about to go into the box. When the
+      // box stays empty this line is the difference between "the hub sent nothing" and "the panel
+      // dropped it" — the pure tests cannot see a live popup, this can.
+      console.info('[FlashFiller] outreach generate', {
+        status: outcome.status, chars: result.chars, textLength: result.text.length,
+        templateKey: result.templateKey, reasons: result.reasons.length,
+      })
+      if (result.templateKey) templateKeyRef.current = result.templateKey
+      setGate(result)
+      setChecked(true)
+      setText(result.text)
+      setStatus(outcome.note)
+      // Written down the moment the hub answers, so switching tabs (which destroys this component)
+      // or clicking the profile behind the popup (which closes it) no longer throws the note away.
+      // Silent and void: a store that refused is not news about his message.
+      if (subject) {
+        void saveOutreachDraft({
+          profile: subject, bracket, gender, ageConfirmed, genderConfirmed,
+          company, standoutSkill, templateKey: templateKeyRef.current,
+          tone: settings.tone as StoredTone, values: values as OutreachValues,
+          text: result.text, sentAt: null,
+        })
+      }
+    } catch (e) {
+      if (seq !== draftSeq.current) return
+      setWire(`threw: ${errorText(e)}`)
+      console.warn('[FlashFiller] outreach generate threw', e)
+      setChecked(false)
+      setGate(null)
+      setStatus(`No draft — ${errorText(e)}. The hub does the filling and the checking; start it with "make serve".`)
+    } finally {
+      if (seq === draftSeq.current) setDrafting(false)
+    }
+  }
+
+
+
+  /**
+   * The one free call a restored note earns. It gates THE STORED TEXT — `text` is passed, so the hub
+   * checks the words on screen rather than filling the template again, which would throw away a
+   * tighten he paid for. Nothing is written back to storage: a bumped `savedAt` would make a note
+   * immortal for as long as he keeps opening the panel, and the week would mean nothing.
+   */
+  const recheck = async (draft: {
+    bracket: LeadAgeBracket; gender: LeadGender; tone: StoredTone
+    values: OutreachValues; text: string; templateKey: string | null
+  }) => {
+    if (!draft.text.trim()) return
+    setRechecking(true)
+    try {
+      const outcome = await draftMessage({
+        bracket: draft.bracket, gender: draft.gender, tone: draft.tone,
+        values: draft.values, text: draft.text, templateKey: draft.templateKey,
+      })
+      setWire(`recheck status=${outcome.status} · textLength=${outcome.draft?.text?.length ?? 0}`
+        + ` · reasons=${outcome.draft?.reasons?.length ?? 0} · note="${outcome.note}"`)
+      if (outcome.status !== 'sent' || !outcome.draft) {
+        // THE NOTE STAYS. Only the verdict is missing, and the button says so in words.
+        setConnClosed(false)
+        setStatus(`Your note is back exactly as you left it — but ${outcome.note} `
+          + 'Read it and copy it; "I sent it" stays dead until the hub has checked it. '
+          + 'Press "Check this note" once the hub is up.')
+        return
+      }
+      const result = readGate(outcome, draft.text)
+      if (result.templateKey) templateKeyRef.current = result.templateKey
+      setGate(result)
+      setChecked(true)
+      setStatus(outcome.note)
+    } catch (e) {
+      setWire(`recheck threw: ${errorText(e)}`)
+      setStatus(`Your note is back exactly as you left it — the hub could not check it (${errorText(e)}). `
+        + 'Read it and copy it; "I sent it" stays dead until it is checked.')
+    } finally {
+      setRechecking(false)
+    }
+  }
+
+  // The panel is destroyed every time he switches tab (both surfaces render it conditionally) and
+  // the popup closes the moment he clicks the profile he is reading. So the note comes back here,
+  // for the person whose page this is and for nobody else. It comes back READABLE and UNSENDABLE:
+  // no verdict is stored, so the hub judges it again before "I sent it" can be pressed.
+  useEffect(() => {
+    let alive = true
+    void (async () => {
+      let stored: StoredOutreachDraft | null = null
+      try {
+        stored = await loadDraftForActiveProfile()
+      } catch {
+        return                      // an unreadable store yields an empty panel, never a broken one
+      }
+      if (!alive || !stored) return
+      const draft = stored
+      capturedRef.current = draft.profile
+      templateKeyRef.current = draft.templateKey
+      const age = readSuggestion<LeadAgeBracket>(
+        { value: draft.profile.suggestedBracket, why: draft.profile.bracketWhy },
+        LEAD_AGE_BRACKET, 'unknown', AGE_ALIASES)
+      const sex = readSuggestion<LeadGender>(
+        { value: draft.profile.suggestedGender, why: draft.profile.genderWhy },
+        LEAD_GENDER, 'unknown', GENDER_ALIASES)
+      // `current || restored` throughout: a restore never clobbers something already typed.
+      setProfile((current) => current ?? readProfile(draft.profile))
+      setAgeSuggestion((current) => current ?? age)
+      setGenderSuggestion((current) => current ?? sex)
+      setBracket(draft.bracket)
+      setGender(draft.gender)
+      setAgeConfirmed(draft.ageConfirmed)
+      setGenderConfirmed(draft.genderConfirmed)
+      setCompany((current) => current || draft.company)
+      setStandoutSkill((current) => current || draft.standoutSkill)
+      setText((current) => current || draft.text)
+      setSentAt(draft.sentAt)
+      setGate(null)                 // no verdict is stored, so none is shown until the hub gives one
+      setChecked(false)
+      const who = draft.profile.fullName ?? 'this person'
+      if (draft.sentAt) {
+        setStatus(`Restored the note you already logged as sent to ${who}. It is here to read; it is not sent again.`)
+        return                      // already logged: there is nothing left to gate
+      }
+      setStatus(`Restored your note for ${who} — re-checking it with the hub before "I sent it" can be pressed.`)
+      if (alive) await recheck(draft)
+    })()
+    return () => { alive = false }
+  }, [])
+
+  const read = async () => {
+    setReading(true)
+    setStatus(null)
+    try {
+      const captured = await captureActiveTabProfile()
+      // The reader's own verdict decides, not whether some fields came back: a refused capture
+      // carries the address it wanted, and treating its envelope as a person would key a lead on
+      // the wrong tab. Read `profile` alone, and say what the reader said.
+      const person = captured.status === 'sent' ? readProfile(captured.profile) : null
+      if (!person) {
+        setStatus(captured.note
+          || 'That tab is not a LinkedIn profile, or the page gave nothing back. Nothing was read, and nothing was changed.')
+        return
+      }
+      // A read that worked but warned (an adapter that found little, say) still says so — the fields
+      // are on screen to be corrected, and silence would imply they were all confirmed.
+      const warning = captured.note && !/^read\b/i.test(captured.note) ? captured.note : null
+      // The reader already ran both suggestions and kept its reasoning (lib/outreach.ts
+      // readProfileWithAdapter): the age bracket from the earliest education or experience year, and
+      // the gender from stated pronouns and nothing else. Read them off the profile rather than
+      // running them again, so the panel and the saved lead cannot disagree about what was suggested.
+      const source = (captured.profile ?? {}) as unknown as Record<string, unknown>
+      const age = readSuggestion<LeadAgeBracket>(
+        { value: source.suggestedBracket, why: source.bracketWhy }, LEAD_AGE_BRACKET, 'unknown', AGE_ALIASES)
+      const sex = readSuggestion<LeadGender>(
+        { value: source.suggestedGender, why: source.genderWhy }, LEAD_GENDER, 'unknown', GENDER_ALIASES)
+      setCompany(companyAfterRead(profile, company, person))
+      setProfile(person)
+      setAgeSuggestion(age)
+      setGenderSuggestion(sex)
+      setBracket(age.value)
+      setGender(sex.value)
+      setAgeConfirmed(false)
+      setGenderConfirmed(false)
+      setSentAt(null)
+      setText('')
+      setGate(null)
+      setChecked(false)
+      templateKeyRef.current = null
+      // Bump the sequence: a `generate` still in flight would otherwise pass its own staleness guard
+      // and write the PREVIOUS person's note into this panel — visible oddity before, a wrong-person
+      // save now that the note is stored.
+      ++draftSeq.current
+      capturedRef.current = (captured.profile ?? null) as LinkedInProfile | null
+      // The panel now shows no note for this person, so the store must not either. Only THIS
+      // person's entry goes — someone else's unsent note is not this press's business.
+      void clearOutreachDraft(person.linkedinUrl)
+      setStatus(`Read ${person.fullName ?? 'this profile'}. The age bracket and gender below are guesses until you press them.`
+        + (warning ? ` ${warning}` : ''))
+    } catch (e) {
+      setStatus(`Nothing was read — ${errorText(e)}.`)
+    } finally {
+      setReading(false)
+    }
+  }
+
+  const persist = (patch: Partial<OutreachSettings>) => {
+    const next = { ...settings, ...patch }
+    setSettings(next)
+    void setOutreachSettings(patch).catch((e) => setStatus(`Not remembered — ${errorText(e)}.`))
+  }
+
+  const addRole = async () => {
+    const role = newRole.trim()
+    if (!role) return
+    try {
+      // addTargetRole may answer with the whole settings object or just the list; either way the
+      // tone and skillset already on screen are kept, never overwritten by a partial answer.
+      const answered = readSettings(await addTargetRole(role))
+      const roles = answered.targetRoles.length ? answered.targetRoles : settings.targetRoles
+      setSettings({
+        ...settings,
+        targetRole: role,
+        targetRoles: roles.includes(role) ? roles : [...roles, role],
+      })
+      setNewRole('')
+      void setOutreachSettings({ lastTargetRole: role }).catch(() => undefined)
+    } catch (e) {
+      setStatus(`"${role}" was not remembered — ${errorText(e)}.`)
+    }
+  }
+
+  // THE note. `text` is what generate() stored; `gate.text` is what the hub said. They are the
+  // same string on the happy path — the fallback exists because a single state slot showing empty
+  // with the draft demonstrably in hand is exactly the failure that removed the textarea.
+  const note = text.trim() ? text : (gate?.text ?? '')
+
+  const runTighten = async () => {
+    const subject = capturedRef.current
+    const ok = confirm(
+      `Shorten this note with one model call?\n\n`
+      + `This is the only thing on this screen that spends money — a fraction of a cent, once, now. `
+      + `It cuts ${note.length - MAX_NOTE_CHARS} characters or more, keeps your draft if it fails, and the `
+      + `result is checked exactly like a note you typed yourself.`,
+    )
+    if (!ok) return
+    setTightening(true)
+    setStatus(null)
+    try {
+      const raw = await tightenMessage(note, values)
+      // tightenMessage RESOLVES on failure with {status:'error', result:null} — it does not throw,
+      // and readGate would then fall through to the envelope and yield ok:false with NO reasons,
+      // which used to set `checked` true and put "I sent it" live on a note the hub never checked.
+      if (raw.status !== 'sent' || !raw.result) {
+        setStatus(`${raw.note} Your draft is exactly as you left it.`)
+        return
+      }
+      const result = readGate(raw, note)
+      setText(result.text)
+      setGate(result)
+      setChecked(true)
+      setStatus(`Tightened to ${result.chars} characters${result.costUsd != null ? ` · $${result.costUsd.toFixed(4)} spent` : ''}. Read it before you send it.`)
+      // The shortened note is the one that COST money — the one thing here that cannot be recreated
+      // for free — so it is written down before anything can lose it.
+      if (subject) {
+        void saveOutreachDraft({
+          profile: subject, bracket, gender, ageConfirmed, genderConfirmed,
+          company, standoutSkill, templateKey: templateKeyRef.current,
+          tone: settings.tone as StoredTone, values: values as OutreachValues,
+          text: result.text, sentAt: null,
+        })
+      }
+    } catch (e) {
+      setStatus(`Not tightened — ${errorText(e)}. Your draft is exactly as you left it.`)
+    } finally {
+      setTightening(false)
+    }
+  }
+
+  const copy = async () => {
+    if (!note.trim()) {
+      setStatus('Nothing to copy yet.')
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(note)
+      setStatus('Copied. Paste it into LinkedIn yourself.')
+    } catch (e) {
+      setStatus(`Not copied — ${errorText(e)}. Select the note above and copy it by hand.`)
+    }
+  }
+
+  const busy = reading || drafting || tightening || sending
+  const generate_ = generateState({
+    missing, ageConfirmed, genderConfirmed, hasTemplate, busy, text: note,
+    // No textbox, so there is nothing of his to overwrite: regenerating replaces one template
+    // fill with another. `generateState` keeps the flag for its own contract; the panel says no.
+    edited: false,
+  })
+  const blockers = sendBlockers({
+    text: note,
+    checked,
+    reasons: gate?.reasons ?? [],
+    linkedinUrl: profile?.linkedinUrl ?? '',
+    busy,
+    sentAt,
+  })
+
+  const send = async () => {
+    if (blockers.length > 0 || !profile) return
+    const ok = confirm(
+      `Log this note to ${profile.fullName ?? 'this person'} as sent?\n\n`
+      + 'Pressing OK records the message in your outreach log as sent, and stamps the time. '
+      + 'It asks LinkedIn nothing: nothing here reads, opens, clicks or sends anything on LinkedIn, '
+      + 'and nothing checks whether the invitation really went. Press it only after you pressed Send '
+      + 'in LinkedIn yourself.',
+    )
+    if (!ok) return
+    setSending(true)
+    setStatus(null)
+    try {
+      // The person as read, then the fields only the human can settle. The bracket and gender that
+      // go to the database are the ones on the chips — a flipped chip overrides the suggestion, and
+      // ageGenderConfirmed records whether he actually looked at both.
+      const lead = await saveLead(
+        {
+          linkedinUrl: profile.linkedinUrl,
+          slug: null,
+          fullName: profile.fullName,
+          firstName: profile.firstName,
+          lastName: profile.lastName,
+          headline: profile.headline,
+          // What you typed, not what was read — the box is the truth, and it is required before a
+          // draft, so it is never blank here. `companyDomain` stays the reader's: it comes from a
+          // contact-info website the profile itself labelled, and nothing on this screen edits it.
+          company: company.trim() || null,
+          companyDomain: profile.companyDomain,
+          roleTitle: profile.roleTitle,
+          location: profile.location,
+          background: profile.background,
+          suggestedBracket: ageSuggestion?.value === 'unknown' ? null : ageSuggestion?.value ?? null,
+          suggestedGender: genderSuggestion?.value === 'unknown' ? null : genderSuggestion?.value ?? null,
+          bracketWhy: ageSuggestion?.why ?? null,
+          genderWhy: genderSuggestion?.why ?? null,
+          layers: {},
+        },
+        {
+          ageBracket: bracket,
+          gender,
+          ageGenderConfirmed: ageConfirmed && genderConfirmed,
+          standoutSkill: standoutSkill.trim(),
+          ...(jobId ? { jobId } : {}),
+        },
+      )
+      const leadId = readLeadId(lead)
+      if (!leadId) throw new Error('the hub saved no lead id back, so the message has nowhere to hang')
+      const sent = await recordSent(leadId, {
+        kind: 'connection_note',
+        templateKey: templateKeyRef.current,
+        body: note,
+        charCount: note.length,
+      })
+      // What actually happened, not what was attempted. A `dead` write must not read as logged, and
+      // a `queued` one must not claim the email lookup has happened — the hub does that when the row
+      // reaches it. Only a write that landed latches the button.
+      const latch = (when: string) => {
+        // Re-saved with sentAt so a restored note comes back LATCHED. Without this a remount would
+        // offer "I sent it" again and make a second `messages` row for one invitation.
+        if (capturedRef.current) {
+          void saveOutreachDraft({
+            profile: capturedRef.current, bracket, gender, ageConfirmed, genderConfirmed,
+            company, standoutSkill, templateKey: templateKeyRef.current,
+            tone: settings.tone as StoredTone, values: values as OutreachValues,
+            text: note, sentAt: when,
+          })
+        }
+      }
+      if (sent.status === 'sent') {
+        { const when = new Date().toISOString(); setSentAt(when); latch(when) }
+        setStatus("Logged as sent. The hub looks this person's email up once, by itself — nothing else happens.")
+      } else if (sent.status === 'queued') {
+        { const when = new Date().toISOString(); setSentAt(when); latch(when) }
+        setStatus(`${sent.note} The email lookup happens when the hub receives it, not before.`)
+      } else {
+        setStatus(`${sent.note} Nothing is logged for this person yet — press it again once that is fixed.`)
+      }
+    } catch (e) {
+      setStatus(`Not logged — ${errorText(e)}. Nothing was written; press it again when the hub is up.`)
+    } finally {
+      setSending(false)
+    }
+  }
+
+  return (
+    <OutreachForm
+      profile={profile}
+      ageSuggestion={ageSuggestion}
+      genderSuggestion={genderSuggestion}
+      bracket={bracket}
+      gender={gender}
+      ageConfirmed={ageConfirmed}
+      genderConfirmed={genderConfirmed}
+      values={values}
+      targetRoles={settings.targetRoles}
+      newRole={newRole}
+      tone={settings.tone}
+      note={note}
+      gate={gate}
+      templateKey={templateKeyRef.current}
+      hasTemplate={hasTemplate}
+      missing={missing}
+      blockers={blockers}
+      tighten={tightenState(note.length, busy)}
+      generate={generate_}
+      count={charCount(note)}
+      reading={reading}
+      drafting={drafting}
+      tightening={tightening}
+      sending={sending}
+      sentAt={sentAt}
+      status={status}
+      wire={wire}
+      rechecking={rechecking}
+      checked={checked}
+      connection={connection}
+      connectionOpen={shouldOpen(connection, connClosed)}
+      on={{
+        read: () => { void read() },
+        setCompany,
+        chooseBracket: (next) => { setBracket(next); setAgeConfirmed(true) },
+        chooseGender: (next) => { setGender(next); setGenderConfirmed(true) },
+        setStandoutSkill,
+        setTargetRole: (value) => persist({ targetRole: value }),
+        setNewRole,
+        addRole: () => { void addRole() },
+        setSkillset: (value) => persist({ skillset: value }),
+        setTone: (value) => persist({ tone: value }),
+        generate: () => { if (generate_.enabled) void generate() },
+        recheck: () => {
+          void recheck({
+            bracket, gender, tone: settings.tone as StoredTone,
+            values: values as OutreachValues, text: note, templateKey: templateKeyRef.current,
+          })
+        },
+        setConnectionOpen: (open) => setConnClosed(!open),
+        setConnection,
+        tighten: () => { void runTighten() },
+        copy: () => { void copy() },
+        send: () => { void send() },
+      }}
+    />
+  )
+}

@@ -1,0 +1,352 @@
+import {
+  TAILOR_BASE_URL,
+  isTerminal,
+  type FinalizeRejected,
+  type FinalizeRequest,
+  type HealthResponse,
+  type MeasureResponse,
+  type TailorEngine,
+  type TailorFamily,
+  type TailorFamilyList,
+  type TailorJob,
+  type TailorLimits,
+  type TailorMeasurement,
+  type TailorRequest,
+  type TailorResult,
+} from '@contract/types'
+import { assertAllowedTailorUrl } from '@/lib/tailor-url'
+import {
+  saveDocument,
+  updateDocument,
+  type DocumentKind,
+  type StoredDocument,
+} from '@/lib/documents'
+
+// ---------------------------------------------------------------------------
+// Tailor client — talks to the Mapper service on 127.0.0.1:8765.
+//
+// House discipline, mirrored from the OpenAI judge: no service running = zero
+// network noise and an honest message, never a broken button or a silent
+// failure. Nothing here throws at import time and nothing runs on a timer.
+//
+// The service is OFF by default (settings.tailorEnabled). A run costs real
+// money against the user's Anthropic key, so it is opt-in, token-gated, and
+// always preceded by a preflight.
+// ---------------------------------------------------------------------------
+
+export const TAILOR_TOKEN_KEY = 'flashfiller_tailor_v1'
+
+export interface TailorConfig {
+  baseUrl: string
+  token: string
+  /**
+   * Which pipeline drafts the résumé (Plan 17). v6 = two agents, one page,
+   * role-family lenses, hard line limits — the default. v5 = the vault-backed
+   * pipeline, kept as the fallback ("switch back if v6 misbehaves").
+   */
+  engine: TailorEngine
+  /** v6: a fixed role-family lens (id / slug); '' = let the router choose. */
+  domain: string
+}
+
+const DEFAULT_CONFIG: TailorConfig = { baseUrl: TAILOR_BASE_URL, token: '', engine: 'v6', domain: '' }
+
+export async function getTailorConfig(): Promise<TailorConfig> {
+  const raw = await chrome.storage.local.get(TAILOR_TOKEN_KEY)
+  const stored = raw?.[TAILOR_TOKEN_KEY] as Partial<TailorConfig> | undefined
+  return {
+    baseUrl: stored?.baseUrl?.trim() || DEFAULT_CONFIG.baseUrl,
+    token: stored?.token?.trim() || '',
+    engine: stored?.engine === 'v5' ? 'v5' : 'v6',
+    domain: stored?.domain?.trim() || '',
+  }
+}
+
+export async function setTailorConfig(patch: Partial<TailorConfig>): Promise<void> {
+  // Validate BEFORE persisting. A rejected address should never reach storage,
+  // or the next request would fail against a value the user thinks was accepted.
+  if (patch.baseUrl !== undefined) assertAllowedTailorUrl(patch.baseUrl.trim())
+  const current = await getTailorConfig()
+  await chrome.storage.local.set({ [TAILOR_TOKEN_KEY]: { ...current, ...patch } })
+}
+
+
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const { baseUrl, token } = await getTailorConfig()
+  assertAllowedTailorUrl(baseUrl)
+
+  let response: Response
+  try {
+    response = await fetch(`${baseUrl}${path}`, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { 'X-Tailor-Token': token } : {}),
+        ...(init.headers ?? {}),
+      },
+    })
+  } catch {
+    // fetch() rejects for connection-refused — the ordinary "service isn't
+    // running" case, not an error worth a stack trace.
+    throw new TailorOfflineError()
+  }
+
+  if (response.status === 401) {
+    throw new Error(
+      'Tailor rejected the token. Set it with "Set token" above — it is printed when ' +
+      '`make serve` starts and cached in apps/mapper/.tailor-token.',
+    )
+  }
+
+  const text = await response.text()
+  let payload: unknown = null
+  if (text) {
+    try {
+      payload = JSON.parse(text)
+    } catch {
+      throw new Error(`Tailor returned a non-JSON response (HTTP ${response.status}).`)
+    }
+  }
+
+  if (response.status === 422 && payload && typeof payload === 'object' && 'violations' in payload) {
+    // v6 finalize refused: an edited box renders over its lines. Nothing was
+    // written or trimmed — the page highlights the boxes and the user shortens.
+    throw new FinalizeRejectedError(payload as FinalizeRejected)
+  }
+
+  if (!response.ok) {
+    const message = (payload as { error?: string } | null)?.error
+    throw new Error(message ?? `Tailor returned HTTP ${response.status}.`)
+  }
+  return payload as T
+}
+
+export class TailorOfflineError extends Error {
+  constructor() {
+    super('Tailor service is not running.')
+    this.name = 'TailorOfflineError'
+  }
+}
+
+/** HTTP 422 from /finalize (v6): the boxes that are over their rendered-line limit. */
+export class FinalizeRejectedError extends Error {
+  readonly violations: TailorMeasurement[]
+  readonly limits: TailorLimits | null
+  constructor(body: FinalizeRejected) {
+    super(body.error || 'Some boxes are over their line limits.')
+    this.name = 'FinalizeRejectedError'
+    this.violations = body.violations ?? []
+    this.limits = body.limits ?? null
+  }
+}
+
+export async function checkHealth(): Promise<HealthResponse | null> {
+  try {
+    return await request<HealthResponse>('/health')
+  } catch (error) {
+    if (error instanceof TailorOfflineError) return null
+    throw error
+  }
+}
+
+export async function startTailor(req: TailorRequest): Promise<TailorJob> {
+  return request<TailorJob>('/tailor', { method: 'POST', body: JSON.stringify(req) })
+}
+
+export async function getJob(jobId: string): Promise<TailorJob> {
+  return request<TailorJob>(`/tailor/${encodeURIComponent(jobId)}`)
+}
+
+export async function cancelJob(jobId: string): Promise<boolean> {
+  const res = await request<{ cancelled: boolean }>(
+    `/tailor/${encodeURIComponent(jobId)}/cancel`,
+    { method: 'POST' },
+  )
+  return res.cancelled
+}
+
+/**
+ * Approve a draft run, with the user's edits, and get the rendered document
+ * back. An empty edits object approves the draft exactly as generated. Only
+ * fields present count as human-edited — the service clears their review
+ * flags; untouched flagged pieces keep warning on the returned result.
+ */
+export async function finalizeJob(jobId: string, edits: FinalizeRequest = {}): Promise<TailorJob> {
+  return request<TailorJob>(`/tailor/${encodeURIComponent(jobId)}/finalize`, {
+    method: 'POST',
+    body: JSON.stringify(edits),
+  })
+}
+
+/**
+ * v6: measure the review boxes as typed — rendered lines and characters per
+ * box under the template's font metrics. No spend, no state change; the page
+ * calls it debounced while the user edits, so the counters are the renderer's
+ * truth rather than a character estimate.
+ */
+export async function measureEdits(jobId: string, edits: FinalizeRequest): Promise<MeasureResponse> {
+  return request<MeasureResponse>(`/tailor/${encodeURIComponent(jobId)}/measure`, {
+    method: 'POST',
+    body: JSON.stringify(edits),
+  })
+}
+
+/** v6: the 31 role families the router can choose (for the lens picker). */
+export async function listFamilies(): Promise<TailorFamily[]> {
+  const res = await request<TailorFamilyList>('/tailor/domains')
+  return res.families ?? []
+}
+
+/** Open the generated .docx directly (view/download) without storing it. */
+export function downloadResultDocument(result: TailorResult): void {
+  if (!result.document) return
+  const { name, mime, bytesB64 } = result.document
+  const url = URL.createObjectURL(base64ToBlob(bytesB64, mime))
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 30_000)
+}
+
+// ---------------------------------------------------------------------------
+// Cover letter — on-demand, per finished run (v5 Phase 7).
+//
+// Same honesty discipline as the run itself: explicit button, cost named up
+// front, job-id + poll (never a long blocking POST), and the letter is REVIEW
+// MATERIAL — it is shown, copied, downloaded or saved to Documents on the
+// user's click, never auto-attached to a page.
+// ---------------------------------------------------------------------------
+
+/** Rough pre-generation estimate — one Haiku analysis + a Sonnet letter. */
+export function estimateCoverLetterCostUsd(): number {
+  return 0.05
+}
+
+/** Ask the service to start letter generation for a DONE run. */
+export async function requestCoverLetter(jobId: string): Promise<TailorJob> {
+  return request<TailorJob>(`/tailor/${encodeURIComponent(jobId)}/coverletter`, {
+    method: 'POST',
+  })
+}
+
+/** Poll until coverLetterStatus leaves 'running'. Runs in the UI page. */
+export async function pollCoverLetter(
+  jobId: string,
+  onUpdate: (job: TailorJob) => void,
+  opts: { intervalMs?: number; timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<TailorJob> {
+  const interval = opts.intervalMs ?? 2000
+  const timeout = opts.timeoutMs ?? 5 * 60 * 1000
+  const startedAt = Date.now()
+
+  for (; ;) {
+    if (opts.signal?.aborted) throw new Error('Stopped watching the cover letter.')
+    const job = await getJob(jobId)
+    onUpdate(job)
+    if ((job.result?.coverLetterStatus ?? 'none') !== 'running') return job
+    if (Date.now() - startedAt > timeout) {
+      throw new Error('Gave up waiting after 5 minutes — reopen to check on the letter.')
+    }
+    await new Promise((resolve) => setTimeout(resolve, interval))
+  }
+}
+
+/** Open the generated letter .docx directly (view/download) without storing it. */
+export function downloadCoverLetterDocument(result: TailorResult): void {
+  if (!result.coverLetterDocument) return
+  const { name, mime, bytesB64 } = result.coverLetterDocument
+  const url = URL.createObjectURL(base64ToBlob(bytesB64, mime))
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 30_000)
+}
+
+/**
+ * Store the letter .docx in Documents as kind 'coverLetter'. From that point
+ * it is a USER-STORED document and the existing document rules govern it —
+ * pickDocument only ever offers it to cover-letter upload zones. saveDocument
+ * auto-stars the first document of a kind; no forced re-star here.
+ */
+export async function saveCoverLetterAsDocument(result: TailorResult): Promise<StoredDocument> {
+  if (!result.coverLetterDocument) {
+    throw new Error('This run has no rendered cover letter document yet.')
+  }
+  const { name, mime, bytesB64 } = result.coverLetterDocument
+  const file = new File([base64ToBlob(bytesB64, mime)], name, { type: mime })
+  return saveDocument(file, 'coverLetter')
+}
+
+/**
+ * Poll until the job reaches a terminal state.
+ *
+ * Runs in the UI page, not the service worker — a worker is torn down at ~30s
+ * idle and this takes minutes. Closing the popup abandons the poll, not the
+ * job: the service keeps running and the result is still there on reopen.
+ */
+export async function pollUntilDone(
+  jobId: string,
+  onUpdate: (job: TailorJob) => void,
+  opts: { intervalMs?: number; timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<TailorJob> {
+  const interval = opts.intervalMs ?? 2500
+  const timeout = opts.timeoutMs ?? 15 * 60 * 1000
+  const startedAt = Date.now()
+
+  for (; ;) {
+    if (opts.signal?.aborted) throw new Error('Stopped watching this run.')
+    const job = await getJob(jobId)
+    onUpdate(job)
+    if (isTerminal(job.status)) return job
+    if (Date.now() - startedAt > timeout) {
+      throw new Error('Gave up waiting after 15 minutes — the run may still be going; reopen to check.')
+    }
+    await new Promise((resolve) => setTimeout(resolve, interval))
+  }
+}
+
+function base64ToBlob(b64: string, mime: string): Blob {
+  const binary = atob(b64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return new Blob([bytes], { type: mime })
+}
+
+/**
+ * Hand the generated document to the existing document store. From here the
+ * resume is indistinguishable from one the user uploaded by hand: pickDocument
+ * matches it, fillFileUpload attaches it, validate verifies it.
+ *
+ * `makeDefault` matters more than it looks. saveDocument only auto-stars the
+ * FIRST document of a kind, so on any machine that already has a resume stored
+ * the freshly tailored one would be saved but NOT be the one pickDocument
+ * attaches — the whole run would silently have no effect on the next
+ * application. A résumé generated for a specific posting is precisely the one
+ * that should go out, so it takes the star by default.
+ */
+export async function saveResultAsDocument(
+  result: TailorResult,
+  { kind = 'resume' as DocumentKind, makeDefault = true } = {},
+): Promise<StoredDocument> {
+  if (!result.document) throw new Error('That run produced bullets but no document.')
+  const { name, mime, bytesB64 } = result.document
+  const file = new File([base64ToBlob(bytesB64, mime)], name, { type: mime })
+  const saved = await saveDocument(file, kind)
+  if (makeDefault && !saved.isDefault) await updateDocument(saved.id, { isDefault: true })
+  return saved
+}
+
+/** Rough pre-run estimate. Real spend comes back on the job as costUsd. */
+export function estimateCostUsd(engine: TailorEngine = 'v6'): number {
+  // v6: Sonnet extractor (~$0.07) + Sonnet writer (~$0.13) + tighten rounds;
+  // v5: the Haiku-tiered vault pipeline (first clean run ~$0.15).
+  return engine === 'v6' ? 0.22 : 0.15
+}
+
+/** v6: re-drafting the same posting under another lens reuses the extraction — writer only. */
+export function estimateRedraftCostUsd(): number {
+  return 0.14
+}

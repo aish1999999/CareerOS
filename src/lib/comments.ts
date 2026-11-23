@@ -1,0 +1,1042 @@
+// ---------------------------------------------------------------------------
+// LinkedIn comments (Stage 9) — the model layer the comment panel sits on.
+//
+// One post, read once, answered in Bob's own words, logged once:
+//
+//   captureActiveTabPost()   ONE chrome.scripting read of the active tab, and only when the human
+//                            presses the button (D13, the rule the job capture and the profile
+//                            capture already follow). Nothing observes a page, nothing polls,
+//                            nothing runs on open. A tab that is not a LinkedIn post is refused
+//                            with the address it wanted.
+//   checkComment()           free — apps/mapper/service/comments.py's `check()` behind
+//                            POST /comments/check. The panel may call it on every keystroke.
+//   draftComment()           THE ONE CALL HERE THAT SPENDS, and only on the button:
+//                            POST /comments/draft writes Bob's typed take as a comment.
+//   saveComment()            the `comments` row, through the hub outbox: insert the first time,
+//                            update every time after (see COMMENT ROWS HAVE NO KEY below).
+//
+// WHAT NOTHING HERE DOES. Nothing is posted, clicked, opened or watched on LinkedIn. There is no
+// "post it" route and no "post it" button: the human copies the comment and posts it himself, and
+// `posted` is true only because he said so (see saveComment). No heuristic in this file writes his
+// take — the take is typed, and the model's whole job is to say THAT well.
+//
+// The two refusals are the hub's, and they are Bob's rule (2026-09-07) rather than a style guide:
+// the comment must mirror the post's register, and it must carry his whole take. He was offered a
+// ban list — no flattery openers, no hashtags, a length cap — and chose this instead, so this file
+// adds no length limit, no banned phrases and no flattery check of its own. A rule lives in exactly
+// one place (apps/mapper/service/comments.py) or it drifts.
+//
+// Lives beside content/ — nothing here touches the fill, the detector, the matcher or the page.
+// ---------------------------------------------------------------------------
+
+import { ENTITY_COLUMNS } from '@contract/entities'
+import { flushHubOutbox, getHubDeadLetters, getHubOutbox, hubInsert, hubQuery, hubUpdate } from '@/lib/hub'
+import { parseLinkedInPost, postUrlOf } from '@/content/adapters/linkedin/post'
+import { grabPage } from '@/lib/job-capture'
+import { getTailorConfig } from '@/lib/tailor'
+import { assertAllowedTailorUrl } from '@/lib/tailor-url'
+
+/** What became of a call. The vocabulary lib/outreach.ts and lib/applications.ts use, so one status
+ *  pill renders all three panels. */
+export type CommentStatus = 'sent' | 'queued' | 'dead' | 'error'
+
+/** Every export below returns at least this, and none of them ever throws at a caller. */
+export interface CommentOutcome {
+  status: CommentStatus
+  /** One sentence for the status line: what happened, and what to do about it. */
+  note: string
+}
+
+// ---- the panel's settings ---------------------------------------------------------------------
+//
+// Its own storage key, never lib/schema.ts and never the main store — the separation
+// lib/documents.ts, lib/applications.ts and lib/outreach.ts all keep. The main store is zod-parsed
+// on every read and a half-typed sentence has no business inside it.
+//
+// WHY A HALF-TYPED TAKE IS WORTH STORING AT ALL: the popup closes the moment you click the page
+// behind it, and reading the post you are commenting on means clicking that page. So the panel is
+// dismissed constantly, mid-sentence, by the very act of doing the task. Losing the take each time
+// would make the panel unusable — it is saved on every pause in typing and read back on open.
+
+export const COMMENT_SETTINGS_KEY = 'flashfiller_comments_v1'
+
+export interface CommentSettings {
+  /** What he was typing when the popup last closed. Restored, never sent anywhere on its own. */
+  lastTake: string
+}
+
+export interface SettingsOutcome extends CommentOutcome {
+  settings: CommentSettings
+}
+
+const DEFAULT_SETTINGS: CommentSettings = { lastTake: '' }
+
+function asSettings(raw: Partial<CommentSettings> | undefined): CommentSettings {
+  return { lastTake: typeof raw?.lastTake === 'string' ? raw.lastTake : '' }
+}
+
+/** The stored settings, or the defaults. A storage that cannot be read yields an empty box he can
+ *  type into, never a broken panel. */
+export async function getCommentSettings(): Promise<CommentSettings> {
+  try {
+    const result = await chrome.storage.local.get(COMMENT_SETTINGS_KEY)
+    return asSettings(result[COMMENT_SETTINGS_KEY] as Partial<CommentSettings> | undefined)
+  } catch {
+    return { ...DEFAULT_SETTINGS }
+  }
+}
+
+/** Merge a patch over what is stored. Says so when the write did not happen — a take that silently
+ *  failed to save is a take he will type again from memory, badly. */
+export async function setCommentSettings(patch: Partial<CommentSettings>): Promise<SettingsOutcome> {
+  const current = await getCommentSettings()
+  const next = asSettings({ ...current, ...patch })
+  try {
+    await chrome.storage.local.set({ [COMMENT_SETTINGS_KEY]: next })
+    return { status: 'sent', note: 'Saved.', settings: next }
+  } catch (e) {
+    return { status: 'error', note: `Not saved — ${e instanceof Error ? e.message : String(e)}`, settings: current }
+  }
+}
+
+/** Shorthand for the panel's on-pause save. */
+export function rememberTake(take: string): Promise<SettingsOutcome> {
+  return setCommentSettings({ lastTake: take })
+}
+
+// ---- the post page ----------------------------------------------------------------------------
+
+/**
+ * One post, as this extension knows it. THIS is the shape the panel renders, the shape draftComment
+ * is fed, and the shape saveComment maps to `comments` columns.
+ *
+ * The DOM work that fills it belongs to content/adapters/linkedin/, which any caller may hand to
+ * captureActiveTabPost as `parse` — the same seam lib/outreach.ts keeps for the profile adapter, and
+ * imported the same way (from a lib module, so it never enters the content-script bundle). Without
+ * one, `readPostDocument` still reads the page's own structured data, and a page that yields too
+ * little says so rather than pretending (see `thin`).
+ */
+export interface LinkedInPost {
+  /** Canonical post permalink — one string per post, whichever route he arrived by. */
+  postUrl: string
+  /** The update's numeric id, from the `urn:li:activity|share|ugcPost:…` the URL carried. Null when
+   *  the URL was a `/posts/` slug with no urn in it. */
+  activityId: string | null
+  author: string | null
+  /** Canonical `https://www.linkedin.com/in/<slug>` when the page named the author's profile. */
+  authorUrl: string | null
+  /** The post itself, as text. Null when the page gave none. */
+  text: string | null
+  /** Words in `text`, counted the way the hub counts them (see POST_MIRROR_MIN_WORDS). */
+  words: number
+  /**
+   * True when the page gave too little text for the mirror rule to mean anything. NOT a failure —
+   * it is the honest half of the deferred vision path (Bob, 2026-09-07: image posts wait): the panel
+   * shows this, and offers a box to paste or type what the post says.
+   */
+  thin: boolean
+  /** Why it reads thin, in the reader's own words. Null when it does not. */
+  thinWhy: string | null
+  /** Whether the page looked like a picture or a video post — the case vision would have covered. */
+  hasImage: boolean
+  /** Which layer supplied each field, for the panel's "where did this come from". */
+  layers: Record<string, string>
+}
+
+/** What content/adapters/linkedin/ supplies: a document and its URL in, whatever it could read out.
+ *  Anything it leaves out falls back to the page's own structured data. */
+export type PostParser = (doc: Document, url: string) => Partial<LinkedInPost> | null
+
+export interface PostCapture extends CommentOutcome {
+  post: LinkedInPost | null
+  /** The tab's <title>, exactly as the page wrote it — unparsed, so the panel can show what it read. */
+  pageTitle: string | null
+  /** The tab's own URL, kept even on a refusal so the message can name what it found. */
+  url: string | null
+}
+
+/**
+ * Below this many words the hub will not judge the register at all — apps/mapper/service/comments.py
+ * `check()` only raises a `register` reason when `post_reg["words"] >= 25`, because a six-word post
+ * has no register to mirror. So it is also exactly the line at which this panel must stop pretending
+ * it read the post: under it, "mirror the post" is unenforceable and the human should paste the text
+ * (or type what the picture says) himself. The number is the hub's, quoted here rather than chosen.
+ */
+export const POST_MIRROR_MIN_WORDS = 25
+
+/** The longest post text worth carrying. A LinkedIn post caps at 3 000 characters; the slack is for
+ *  a structural read that swept in a little page furniture, and the hub's body limit is 1 MB. */
+const TEXT_MAX = 12_000
+
+// The two URL shapes a single post is reached by. `/posts/…-activity-<id>-<hash>` is the share link
+// LinkedIn puts on the clipboard; `/feed/update/urn:li:activity:<id>` is what the app navigates to.
+// Both are ONE post, so both must canonicalise to one string — that string is this module's row key
+// (see saveComment), and a key that disagreed with itself would file one post as two rows.
+const FEED_URN = /\/feed\/update\/(urn:li:(?:activity|share|ugcPost):(\d+))/i
+const POST_ACTIVITY = /\/posts\/[^/?#]*?-activity-(\d+)(?:-|\/|$)/i
+const POST_SLUG = /^\/posts\/([^/?#]+)/i
+const PROFILE_PATH = /^\/in\/([^/?#]+)/i
+
+function isLinkedInHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.$/, '')
+  return host === 'linkedin.com' || host.endsWith('.linkedin.com')
+}
+
+function decodedPath(parsed: URL): string {
+  try {
+    return decodeURIComponent(parsed.pathname)
+  } catch {
+    return parsed.pathname
+  }
+}
+
+/**
+ * The canonical permalink for a LinkedIn post and its activity id, or null when this is not one post.
+ *
+ * Deliberately narrow: the feed itself (`/feed/`) is not a post, a profile is not a post, and a job
+ * posting is the job capture's page. Anything it does not recognise is refused by name rather than
+ * guessed at, because the alternative is a `comments` row filed under a URL that is not a post.
+ */
+export function postUrl(url: string | null | undefined): { canonical: string; activityId: string | null } | null {
+  if (!url) return null
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return null
+  }
+  if (!/^https?:$/i.test(parsed.protocol) || !isLinkedInHost(parsed.hostname)) return null
+  const path = decodedPath(parsed)
+
+  const feed = FEED_URN.exec(path)
+  if (feed) return { canonical: `https://www.linkedin.com/feed/update/${feed[1].toLowerCase().replace('urn:li:ugcpost:', 'urn:li:ugcPost:')}`, activityId: feed[2] }
+
+  const activity = POST_ACTIVITY.exec(path)
+  if (activity) return { canonical: `https://www.linkedin.com/feed/update/urn:li:activity:${activity[1]}`, activityId: activity[1] }
+
+  // A /posts/ link that carries no activity id still names one post; its own slug is the key.
+  const slug = POST_SLUG.exec(path)
+  if (slug) {
+    const clean = slug[1].trim().toLowerCase()
+    if (clean) return { canonical: `https://www.linkedin.com/posts/${clean}`, activityId: null }
+  }
+  return null
+}
+
+/** Canonical profile URL for the post's author, on the same host rule. Null for anything else. */
+function authorProfileUrl(url: string | null | undefined): string | null {
+  if (!url) return null
+  let parsed: URL
+  try {
+    parsed = new URL(url, 'https://www.linkedin.com')
+  } catch {
+    return null
+  }
+  if (!isLinkedInHost(parsed.hostname)) return null
+  const match = PROFILE_PATH.exec(decodedPath(parsed))
+  if (!match) return null
+  let slug: string
+  try {
+    slug = decodeURIComponent(match[1]).trim().toLowerCase()
+  } catch {
+    slug = match[1].trim().toLowerCase()
+  }
+  return slug ? `https://www.linkedin.com/in/${slug}` : null
+}
+
+/** The same word the hub counts: a letter-led run, apostrophes and hyphens allowed. Kept identical
+ *  to comments.py's WORD so `thin` here and the register gate there never disagree. */
+const WORD = /[A-Za-z][A-Za-z'’-]*/g
+
+export function countWords(text: string | null | undefined): number {
+  return (text ?? '').match(WORD)?.length ?? 0
+}
+
+function text(value: unknown, max = TEXT_MAX): string | null {
+  if (typeof value !== 'string') return null
+  const clean = value.replace(/[ \t ]+/g, ' ').replace(/\s*\n\s*/g, '\n').trim()
+  if (!clean) return null
+  return clean.length <= max ? clean : clean.slice(0, max).trim()
+}
+
+function metaOf(doc: Document, property: string): string | null {
+  const el = doc.querySelector(`meta[property="${property}"], meta[name="${property}"]`)
+  return text(el?.getAttribute('content'), TEXT_MAX)
+}
+
+function findPosting(node: unknown): Record<string, unknown> | null {
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findPosting(item)
+      if (found) return found
+    }
+    return null
+  }
+  if (typeof node !== 'object' || node === null) return null
+  const obj = node as Record<string, unknown>
+  const type = obj['@type']
+  const types = Array.isArray(type) ? type.map(String) : [String(type ?? '')]
+  if (types.some((t) => /Posting$|^Article$|^SocialMediaPosting$|^DiscussionForumPosting$/.test(t))) return obj
+  if (obj['@graph']) return findPosting(obj['@graph'])
+  return null
+}
+
+/** "Priya Menon on LinkedIn: we finally fixed the seal plan | 12 comments" → the two halves. */
+function splitPostTitle(title: string | null): { author: string | null; text: string | null } {
+  if (!title) return { author: null, text: null }
+  const stripped = title.replace(/^\(\d+\)\s*/, '').replace(/\s*\|\s*\d+\s+comments?\s*$/i, '')
+    .replace(/\s*\|\s*LinkedIn\s*$/i, '').trim()
+  if (!stripped || /^linkedin$/i.test(stripped)) return { author: null, text: null }
+  const split = /^(.{2,80}?)\s+on\s+LinkedIn:\s*(.+)$/is.exec(stripped)
+  if (split) return { author: text(split[1], 120), text: text(split[2]) }
+  return { author: null, text: text(stripped) }
+}
+
+/** The readable text of a container, minus the furniture a post page wraps it in. Structural only —
+ *  no LinkedIn class name, so a redesign degrades this rather than silently emptying it. */
+function containerText(el: Element): string | null {
+  const clone = el.cloneNode(true) as Element
+  // Deliberately NOT `[aria-hidden="true"]`: LinkedIn marks the VISIBLE copy of a post aria-hidden
+  // and puts the screen-reader copy in a `.visually-hidden` sibling — which lib/job-capture.ts's
+  // grabPage has already stripped by the time this runs. Removing both would leave an empty post.
+  for (const junk of Array.from(clone.querySelectorAll('nav, aside, header, footer, button, form, [role="button"], [role="navigation"]'))) junk.remove()
+  return text(clone.textContent)
+}
+
+/**
+ * What any post page states about itself — JSON-LD first, then the post's own container, then Open
+ * Graph and the page title. Deliberately structural: it reads no LinkedIn class name, so it neither
+ * duplicates nor competes with content/adapters/linkedin/. It is the floor under an adapter, not a
+ * second one, and it is what runs when no parser is handed in.
+ */
+export function readPostDocument(doc: Document, url: string): Partial<LinkedInPost> {
+  const layers: Record<string, string> = {}
+  let posting: Record<string, unknown> | null = null
+  for (const script of Array.from(doc.querySelectorAll('script[type="application/ld+json"]'))) {
+    try {
+      posting = findPosting(JSON.parse(script.textContent ?? ''))
+    } catch {
+      continue
+    }
+    if (posting) break
+  }
+
+  const pageTitle = text(doc.title, 600) ?? metaOf(doc, 'og:title')
+  const titleParts = splitPostTitle(pageTitle)
+  const author = posting?.author as Record<string, unknown> | string | undefined
+
+  // The post's own container, found by the urn LinkedIn stamps on it rather than by a class name.
+  // The longest candidate wins: a post page also renders its comments, and each of those carries a
+  // urn of its own — the update itself is the biggest block of text on the page.
+  let fromPage: string | null = null
+  try {
+    const candidates = Array.from(doc.querySelectorAll('[data-urn*="urn:li:activity"], [data-id*="urn:li:activity"], [data-urn*="urn:li:share"], article'))
+    for (const el of candidates) {
+      const block = containerText(el)
+      if (block && block.length > (fromPage?.length ?? 0)) fromPage = block
+    }
+  } catch {
+    /* an exotic selector on an exotic document: the structured data is enough */
+  }
+
+  const put = <T>(field: string, candidates: [T | null | undefined, string][]): T | null => {
+    for (const [value, layer] of candidates) {
+      if (value !== null && value !== undefined && value !== '') {
+        layers[field] = layer
+        return value
+      }
+    }
+    return null
+  }
+
+  const body = put<string>('text', [
+    [text(posting?.articleBody ?? posting?.text ?? posting?.description), 'jsonld'],
+    [fromPage, 'page'],
+    [metaOf(doc, 'og:description'), 'meta'],
+    [titleParts.text, 'title'],
+  ])
+  const who = put<string>('author', [
+    [typeof author === 'string' ? text(author, 120) : text(author?.name, 120), 'jsonld'],
+    [titleParts.author, 'title'],
+    [metaOf(doc, 'article:author'), 'meta'],
+  ])
+  const whoUrl = put<string>('authorUrl', [
+    [typeof author === 'object' && author ? authorProfileUrl(author.url as string) ?? authorProfileUrl(author.sameAs as string) : null, 'jsonld'],
+    [authorProfileUrl(doc.querySelector('a[href*="/in/"]')?.getAttribute('href')), 'page'],
+  ])
+
+  // og:image is on nearly every LinkedIn page, so it is not evidence on its own; an <img> inside the
+  // post's own container is. Either way this only ever explains a thin read — nothing is inferred
+  // from a picture, because reading pictures is deferred.
+  let hasImage = false
+  try {
+    hasImage = !!doc.querySelector('[data-urn*="urn:li:activity"] img, article img, [data-test-id*="image"]')
+  } catch {
+    hasImage = false
+  }
+
+  return {
+    activityId: postUrl(url)?.activityId ?? null,
+    author: who,
+    authorUrl: whoUrl,
+    text: body,
+    hasImage,
+    layers,
+  }
+}
+
+function toPost(partial: Partial<LinkedInPost> | null, canonical: string, url: string): LinkedInPost {
+  const p = partial ?? {}
+  const body = p.text ?? null
+  const words = countWords(body)
+  const hasImage = p.hasImage === true
+  const thin = words < POST_MIRROR_MIN_WORDS
+  return {
+    postUrl: canonical,
+    activityId: p.activityId ?? postUrl(url)?.activityId ?? null,
+    author: p.author ?? null,
+    authorUrl: p.authorUrl ?? null,
+    text: body,
+    words,
+    thin,
+    // The vision path is deferred, so the honest answer to a picture is a sentence and a text box —
+    // never a guess at what the picture said, and never a comment drafted on nothing.
+    thinWhy: !thin ? null
+      : hasImage
+        ? `This post is mostly a picture or a video — reading images is not built yet, so paste or type what it says (the page gave ${words} word${words === 1 ? '' : 's'} of text).`
+        : `The page gave only ${words} word${words === 1 ? '' : 's'} of post text — too little to mirror. Scroll the post open and press this again, or paste the text in.`,
+    hasImage,
+    layers: p.layers ?? {},
+  }
+}
+
+/**
+ * Read the post in the active tab. ONE injected read, on the button press and nowhere else — no
+ * observer, no interval, no listener on a LinkedIn page. The page is only READ: chrome.scripting
+ * returns an HTML snapshot and every bit of parsing happens on this side, so nothing this extension
+ * runs can click, type, like, post or send anything on LinkedIn.
+ *
+ * `parse` is where content/adapters/linkedin/ plugs in. Its absence is not a failure: the page's own
+ * structured data still yields the text and the author, and a page that yields too little comes back
+ * `thin` with a sentence saying so, which is the panel's cue to offer the paste box.
+ */
+/**
+ * The default reader: the LinkedIn post adapter first, this module's structured-data reading behind
+ * it.
+ *
+ * The adapter knows the page's own markup — it strips the comment threads before reading the body,
+ * so a commenter's reply cannot become the post the model is asked to mirror, and it works out
+ * whether the body is clamped behind a "see more" or is really just a caption under a picture.
+ * Those two verdicts are the whole of the deferred vision path: they are what makes the panel ask
+ * for the text instead of guessing at it. Where the adapter finds nothing, the page's own metadata
+ * still yields a body and an author, so a LinkedIn markup change degrades the read rather than
+ * emptying it.
+ */
+export function readPostWithAdapter(doc: Document, url: string): Partial<LinkedInPost> {
+  const base = readPostDocument(doc, url)
+  try {
+    const read = parseLinkedInPost(doc, url)
+    const text = read.text ?? base.text ?? null
+    const layers = { ...(base.layers ?? {}) }
+    for (const [field, value] of Object.entries({ author: read.author, authorUrl: read.authorUrl, text })) {
+      if (value) layers[field] = 'adapter'
+    }
+    return {
+      ...base,
+      postUrl: postUrlOf(url) ?? base.postUrl,
+      author: read.author ?? base.author ?? null,
+      authorUrl: read.authorUrl ?? base.authorUrl ?? null,
+      text,
+      words: countWords(text),
+      // The adapter's verdict wins where it has one: it saw the markup, this module saw the metadata.
+      thin: read.truncated || read.isImageOnly || base.thin,
+      hasImage: read.isImageOnly || Boolean(base.hasImage),
+      layers,
+    }
+  } catch {
+    return base                                  // a throwing adapter costs its half, not the read
+  }
+}
+
+export async function captureActiveTabPost(parse: PostParser = readPostWithAdapter): Promise<PostCapture> {
+  const wanted = 'open the post itself — its linkedin.com/posts/… or linkedin.com/feed/update/… page — and press this again.'
+  let url: string | null = null
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+    url = typeof tab?.url === 'string' ? tab.url : null
+    if (!tab?.id || !url) {
+      return { status: 'error', post: null, pageTitle: null, url, note: `No page open — ${wanted}` }
+    }
+    const target = postUrl(url)
+    if (!target) {
+      let where = url
+      try {
+        const parsed = new URL(url)
+        where = parsed.hostname + parsed.pathname
+      } catch {
+        /* an opaque URL: name it as it came */
+      }
+      return {
+        status: 'error', post: null, pageTitle: null, url,
+        note: `That tab is ${where} — this reads one LinkedIn post, so ${wanted}`,
+      }
+    }
+
+    const injections = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: grabPage })
+    const page = injections.map((i) => i.result as { html?: string; url?: string; title?: string } | null | undefined)
+      .find((p) => !!p && typeof p.html === 'string' && p.html.length > 0)
+    if (!page?.html) {
+      return { status: 'error', post: null, pageTitle: null, url, note: 'Could not read that page — reload the post and press this again.' }
+    }
+    const pageTitle = typeof page.title === 'string' && page.title ? page.title : null
+    const doc = new DOMParser().parseFromString(page.html, 'text/html')
+    const read = page.url ?? url
+
+    let parsed: Partial<LinkedInPost> | null = null
+    try {
+      parsed = parse(doc, read)
+    } catch (e) {
+      // an adapter that threw must not lose the read: fall back and SAY so
+      const fallback = toPost(readPostDocument(doc, read), target.canonical, read)
+      return {
+        status: 'error', post: fallback, pageTitle, url,
+        note: `The post adapter failed (${e instanceof Error ? e.message : String(e)}) — only the page’s own structured data was read. Check the post text before drafting.`,
+      }
+    }
+    const post = toPost(parsed, target.canonical, read)
+    if (post.thin) {
+      // Not an error the caller should hide: the capture WORKED, the page just had little to read.
+      // The panel shows thinWhy beside a box he can paste into, and drafting stays available.
+      return { status: 'sent', post, pageTitle, url, note: post.thinWhy ?? 'The page gave very little post text — paste or type it in.' }
+    }
+    return {
+      status: 'sent', post, pageTitle, url,
+      note: `Read ${post.words} words${post.author ? ` from ${post.author}` : ''}.`,
+    }
+  } catch (e) {
+    return { status: 'error', post: null, pageTitle: null, url, note: `Could not read the page — ${e instanceof Error ? e.message : String(e)}` }
+  }
+}
+
+// ---- the hub's comment routes -----------------------------------------------------------------
+//
+// Thin on purpose. The register measurement, the coverage measurement, the two refusals and the
+// drafting prompt are apps/mapper/service/comments.py's, and nothing here second-guesses them.
+
+/** How a piece of writing reads, as comments.py measured it. */
+export interface CommentRegister {
+  words: number
+  sentences: number
+  wordsPerSentence: number
+  longWordShare: number
+  acronyms: number
+  numbers: number
+  /** plain · mixed · technical — the bucket the mirror rule compares. */
+  level: string
+  score: number
+}
+
+/** How much of the take the draft carries. */
+export interface CommentCoverage {
+  terms: string[]
+  carried: string[]
+  dropped: string[]
+  share: number
+}
+
+/** One reason this comment may not be posted as written, and what to do about it. Never an edit. */
+export interface CommentReason {
+  /** `register`, `take_dropped` or `empty` — Bob's two rules, plus "there is no comment". */
+  code: string
+  detail: string
+  fix: string
+}
+
+export interface CommentCheck {
+  ok: boolean
+  text: string
+  chars: number
+  reasons: CommentReason[]
+  register: { post: CommentRegister; comment: CommentRegister }
+  coverage: CommentCoverage
+}
+
+export interface CommentDraft extends CommentCheck {
+  model: string
+  usage: { input: number | null; output: number | null }
+  costUsd: number
+}
+
+export interface CheckOutcome extends CommentOutcome {
+  /** Null whenever the check did not happen — the panel then shows nothing rather than a false pass. */
+  check: CommentCheck | null
+}
+
+export interface DraftOutcome extends CommentOutcome {
+  /** Null whenever the draft did not happen — the caller keeps whatever it already had. */
+  draft: CommentDraft | null
+}
+
+type Call<T> = { ok: true; body: T } | { ok: false; note: string }
+
+async function call<T>(path: string, init: RequestInit = {}): Promise<Call<T>> {
+  let response: Response
+  try {
+    const { baseUrl, token } = await getTailorConfig()
+    assertAllowedTailorUrl(baseUrl)
+    response = await fetch(`${baseUrl}${path}`, {
+      ...init,
+      headers: { 'Content-Type': 'application/json', ...(token ? { 'X-Tailor-Token': token } : {}), ...(init.headers ?? {}) },
+    })
+  } catch {
+    // connection refused is the ordinary "the hub isn't running" case, not a stack trace
+    return { ok: false, note: 'The hub is not running — start it with `make serve` and try again.' }
+  }
+  if (response.status === 401) {
+    return { ok: false, note: 'The hub rejected the token — set it in the Tailor tab.' }
+  }
+  const raw = await response.text()
+  let payload: unknown = null
+  if (raw) {
+    try {
+      payload = JSON.parse(raw)
+    } catch {
+      return { ok: false, note: `The hub answered with something that is not JSON (HTTP ${response.status}).` }
+    }
+  }
+  if (!response.ok) {
+    const message = (payload as { error?: string } | null)?.error
+    return { ok: false, note: message ?? `The hub answered HTTP ${response.status}.` }
+  }
+  return { ok: true, body: payload as T }
+}
+
+function reasonsOf(body: { reasons?: unknown } | null): CommentReason[] {
+  return Array.isArray(body?.reasons) ? (body.reasons as CommentReason[]) : []
+}
+
+/** The sentence a panel puts under the box: nothing to fix, or every fix, in the hub's own words. */
+function verdict(reasons: CommentReason[], ready: string): string {
+  return reasons.length === 0 ? ready : `Not ready: ${reasons.map((r) => r.fix).join('; ')}.`
+}
+
+export interface CheckRequest {
+  /** The comment as it stands in the box — his edit of the draft, or something he typed himself. */
+  text: string
+  /** His view. Both refusals are measured against it, so it travels with every check. */
+  take: string
+  /** The post being answered. Without it the register rule has nothing to mirror. */
+  postText: string
+}
+
+/**
+ * Measure the comment in the box against Bob's rule. Spends NOTHING, so the panel may call it on
+ * every keystroke — and it is what makes the panel honest about a comment he typed or edited
+ * himself, not only about one the model wrote.
+ */
+export async function checkComment(request: CheckRequest): Promise<CheckOutcome> {
+  const body = { text: request.text ?? '', take: request.take ?? '', postText: request.postText ?? '' }
+  const res = await call<CommentCheck>('/comments/check', { method: 'POST', body: JSON.stringify(body) })
+  if (!res.ok) return { status: 'error', note: `Not checked — ${res.note}`, check: null }
+  const check = res.body
+  if (!check || typeof check.ok !== 'boolean') {
+    return { status: 'error', note: 'The hub answered without a verdict.', check: null }
+  }
+  const reasons = reasonsOf(check)
+  return {
+    status: 'sent', check: { ...check, reasons },
+    note: verdict(reasons, `Ready — ${check.chars} characters, ${check.register?.comment?.level ?? 'unmeasured'} against a ${check.register?.post?.level ?? 'unmeasured'} post.`),
+  }
+}
+
+export interface DraftRequest {
+  /** The post, read from the page or pasted in by hand when the page gave thin text. */
+  postText: string
+  /** His view, typed. The comment is written to say THIS — nothing here writes it for him. */
+  take: string
+  /** Whose post it is, when the page said. Only ever context for the prompt. */
+  author?: string | null
+}
+
+/**
+ * THE ONE CALL IN STAGE 9 THAT SPENDS, and only because the human pressed Draft. One model call, one
+ * comment back, measured on arrival by the same two rules a typed comment goes through — so a draft
+ * that misses his point or the post's register comes back refused rather than shipped.
+ *
+ * An empty take never leaves the machine: the comment is his view, and there is nothing to spend on
+ * until he has written one.
+ */
+export async function draftComment(request: DraftRequest): Promise<DraftOutcome> {
+  if (!(request.take ?? '').trim()) {
+    return { status: 'error', note: 'Write your take first — the comment is your view, not the model’s.', draft: null }
+  }
+  const body: Record<string, unknown> = { postText: request.postText ?? '', take: request.take }
+  if (request.author) body.author = request.author
+  const res = await call<CommentDraft>('/comments/draft', { method: 'POST', body: JSON.stringify(body) })
+  if (!res.ok) {
+    // A 503 here is the ordinary "no ANTHROPIC_API_KEY" / "the model declined" case. It is a
+    // sentence, not a thrown error: nothing was written, nothing was spent, and the box is untouched.
+    return { status: 'error', note: `Not drafted, nothing was written — ${res.note}`, draft: null }
+  }
+  const draft = res.body
+  if (!draft || typeof draft.text !== 'string' || !draft.text.trim()) {
+    return { status: 'error', note: 'The model returned nothing — nothing was drafted.', draft: null }
+  }
+  const reasons = reasonsOf(draft)
+  const spend = typeof draft.costUsd === 'number' ? `$${draft.costUsd}` : 'cost unreported'
+  return {
+    status: 'sent', draft: { ...draft, reasons },
+    note: verdict(reasons, `Drafted — ${draft.chars} characters, ${draft.register?.comment?.level ?? 'unmeasured'} against a ${draft.register?.post?.level ?? 'unmeasured'} post (${spend}).`),
+  }
+}
+
+// ---- writing the comment log ------------------------------------------------------------------
+//
+// COMMENT ROWS HAVE NO KEY. Every other writer in this extension upserts: `leads` has
+// (user_id, linkedin_url), `applications` has (user_id, job_id, surface), `jobs` has a dedupe_key.
+// `comments` has none — packages/contract/entities.ts gives it no unique constraint, and inventing
+// one here would mean an onConflict the database does not have, which PostgREST answers with a 42P10
+// error, not a merge. Adding the constraint is a migration, and a migration is not this file's to
+// make.
+//
+// So this module remembers instead: the hub's row id, kept locally under the comment's identity, in
+// its own storage key. The first save INSERTs and stores the id; every save after it UPDATEs that
+// id. Drafting twice on one post is therefore one row, which is the whole point. That identity is
+// the canonical post URL when the post was read, and a minted `local:…` when it was not — see
+// LOCAL_COMMENT_PREFIX below for what the minted one costs.
+//
+// Two things make the memory safe to lose. A cleared local store is not a duplicate: before
+// inserting, saveComment asks the hub whether it already holds a row for this post URL
+// (`remoteId`), exactly as lib/applications.ts reads a row back before its first event. And a save
+// made while the hub is down does NOT insert twice — the queued ref is remembered too, and a second
+// press while it is still waiting is reported as still-waiting rather than enqueued again.
+
+export const COMMENT_ROWS_KEY = 'flashfiller_comment_rows_v1'
+
+// A comment does not always HAVE a post URL. Drafting never needed one — the panel writes from a
+// pasted post, or from the take alone when the post is a picture — and refusing to file the result
+// meant the one path the vision deferral left open ended at a button that could not be pressed.
+//
+// So a comment with no post URL gets a local identity instead: minted here, kept in the same
+// envelope, and reused for every later save of that same draft. What it does NOT get is the
+// recovery a URL buys. With a URL, a cleared store is harmless — `remoteId` asks the hub whether it
+// already holds the row. Without one there is nothing to ask about, so a save made after the local
+// memory is gone INSERTS A SECOND ROW. That is the honest cost of having no key, it is stated in
+// the outcome note, and it is the reason a read post is still the better way to file one.
+export const LOCAL_COMMENT_PREFIX = 'local:'
+
+/** Whether this identity is a minted one — a comment filed with no post URL behind it. */
+export function isLocalCommentKey(key: string): boolean {
+  return key.startsWith(LOCAL_COMMENT_PREFIX)
+}
+
+function mintLocalKey(): string {
+  const rand = globalThis.crypto?.randomUUID?.()
+    ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  return `${LOCAL_COMMENT_PREFIX}${rand}`
+}
+
+export interface CommentRecord {
+  /** This row's identity in the envelope: the canonical post URL, or a minted `local:…` when the
+   *  comment was drafted without one. Never empty. */
+  key: string
+  /** The canonical post URL, or '' when the comment was drafted from a pasted post or a take alone.
+   *  When it is set it is also the key, and the column the hub is asked about. */
+  postUrl: string
+  /** The hub's row id, once it has landed. Null while the first insert is still queued. */
+  id: string | null
+  /** The outbox ref of an insert that has not landed yet. Null once it has. */
+  pendingRef: string | null
+  author: string | null
+  /** The post this was written about, as it was MEASURED — the pasted text when he pasted one.
+   *  Kept so the panel's last-three table can put it back in the box; the row already sends it. */
+  postText: string
+  take: string
+  draft: string
+  finalText: string
+  posted: boolean
+  postedAt: string | null
+  updatedAt: number
+  lastOutcome: CommentStatus | null
+}
+
+interface CommentsEnvelope {
+  schemaVersion: number
+  byPost: Record<string, CommentRecord>
+}
+
+function isRecord(raw: unknown): raw is CommentRecord {
+  if (typeof raw !== 'object' || raw === null) return false
+  const r = raw as Record<string, unknown>
+  return typeof r.postUrl === 'string' && typeof r.updatedAt === 'number'
+}
+
+/** Records written before comments had an identity of their own are keyed by their URL, which is
+ *  what they were stored under, and carry no post text. Read forward, never rewritten in place. */
+function withKey(entry: CommentRecord, storedUnder: string): CommentRecord {
+  return {
+    ...entry,
+    key: typeof entry.key === 'string' && entry.key ? entry.key : storedUnder,
+    postText: typeof entry.postText === 'string' ? entry.postText : '',
+  }
+}
+
+async function readEnvelope(): Promise<CommentsEnvelope> {
+  try {
+    const result = await chrome.storage.local.get(COMMENT_ROWS_KEY)
+    const raw = result[COMMENT_ROWS_KEY] as Partial<CommentsEnvelope> | undefined
+    const byPost: Record<string, CommentRecord> = {}
+    for (const [k, v] of Object.entries(raw?.byPost ?? {})) if (isRecord(v)) byPost[k] = withKey(v, k)
+    return { schemaVersion: 1, byPost }
+  } catch {
+    return { schemaVersion: 1, byPost: {} }
+  }
+}
+
+async function writeEnvelope(env: CommentsEnvelope): Promise<void> {
+  try {
+    await chrome.storage.local.set({ [COMMENT_ROWS_KEY]: env })
+  } catch {
+    // A storage that cannot be written loses the memory, never the write: the hub row is the record,
+    // and the next save reads the id back from the hub (remoteId) rather than inserting a second one.
+  }
+}
+
+/** What this machine remembers about the comment on one post. Null when it has never saved one. */
+export async function getCommentRecord(url: string): Promise<CommentRecord | null> {
+  const key = postUrl(url)
+  if (!key) return null
+  return (await readEnvelope()).byPost[key.canonical] ?? null
+}
+
+/** Every comment this machine has saved, newest first. */
+export async function loadComments(): Promise<CommentRecord[]> {
+  const env = await readEnvelope()
+  return Object.values(env.byPost).sort((a, b) => b.updatedAt - a.updatedAt)
+}
+
+export interface CommentFields {
+  /** The identity a previous save of THIS draft returned, when it had no post URL to be filed
+   *  under. Passing it back is what makes a second press an update rather than a second row;
+   *  omitting it on a URL-less comment mints a new one. Ignored when the post carries a URL. */
+  key?: string
+  /** His view, as typed. */
+  take?: string
+  /** What the model wrote, kept beside `finalText` so an edit is visible as an edit. */
+  draft?: string
+  /** What he actually intends to post, after his own edits. */
+  finalText?: string
+  /**
+   * TRUE ONLY BECAUSE HE SAID SO. Nothing detects a posted comment, nothing checks LinkedIn, and no
+   * route posts one — he copies the comment, posts it himself, and then presses the button. Leave it
+   * undefined and the stored value is untouched.
+   */
+  posted?: boolean
+  /** When he pressed it. Defaults to now — which is the point. */
+  postedAt?: Date
+}
+
+export interface SaveOutcome extends CommentOutcome {
+  /** The hub's row id, when the row has landed. Null while it is still queued. */
+  commentId: string | null
+  /** Exactly the columns that were sent. */
+  row: Record<string, unknown>
+  /** What this machine now remembers about this post. */
+  record: CommentRecord | null
+}
+
+const COMMENT_COLUMNS = new Set<string>(ENTITY_COLUMNS.comments)
+
+/** Only the columns this writer actually knows: nothing null, nothing empty, nothing invented, and
+ *  nothing the entity contract does not have. PostgREST merges what it is sent, so a column left out
+ *  keeps whatever the stored row already holds — an omission is never an erasure. */
+function columnsKnown(draft: Record<string, unknown>, allowed: Set<string>): Record<string, unknown> {
+  const row: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(draft)) {
+    if (value === null || value === undefined || value === '') continue
+    if (!allowed.has(key)) continue
+    row[key] = value
+  }
+  return row
+}
+
+// One writer at a time. An enqueue that lands during another writer's in-flight flush would be
+// dropped by that flush's write-back and then reported as sent because it is in no list — the same
+// hazard lib/outreach.ts and lib/job-capture.ts queue against. It also serialises the read-modify-
+// write on the id memory, which is what stops two presses from both deciding to insert.
+let writeChain: Promise<unknown> = Promise.resolve()
+
+function enqueue<T>(work: () => Promise<T>): Promise<T> {
+  const run = writeChain.then(work, work)
+  writeChain = run.then(() => undefined, () => undefined)
+  return run
+}
+
+interface Settled {
+  status: CommentStatus
+  row: Record<string, unknown> | null
+  note: string
+}
+
+/** What an enqueued ref came to. ONE flush, and the verdict read from that one report: a second
+ *  flush would find the outbox already empty and call a row written a moment ago unanswered. */
+async function settle(ref: string): Promise<Settled> {
+  const report = await flushHubOutbox()
+  const stored = report.rows?.[ref]
+  if (stored) return { status: 'sent', row: stored, note: '' }
+  const died = (await getHubDeadLetters()).find((d) => d.ref === ref)
+  if (died) return { status: 'dead', row: null, note: died.lastError ?? `HTTP ${died.status}` }
+  if ((await getHubOutbox()).some((e) => e.ref === ref)) return { status: 'queued', row: null, note: report.reason ?? 'not sent yet' }
+  return { status: 'error', row: null, note: 'the hub gave no answer for this write' }
+}
+
+/** The hub's own row for a post this machine has forgotten — a cleared local store must not become a
+ *  duplicate row. Null when the hub is unreachable or holds none; the save then inserts. */
+async function remoteId(canonical: string): Promise<string | null> {
+  try {
+    const rows = await hubQuery<{ id?: unknown }>('comments', {
+      post_url: `eq.${canonical}`, order: 'created_at.desc', limit: '1', select: 'id',
+    })
+    const row = Array.isArray(rows) ? rows[0] : undefined
+    return typeof row?.id === 'string' ? row.id : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Write the comment on this post: INSERT the first time, UPDATE every time after.
+ *
+ * `posted` is the one field nothing infers. It is true only when the caller passes true, because the
+ * human pressed "I posted it" — and `posted_at` is stamped at that moment, from this machine's
+ * clock, never from anything read off a page. Passing false is an explicit un-marking and clears
+ * `posted_at` with it; leaving it out touches neither.
+ */
+export function saveComment(post: LinkedInPost, fields: CommentFields = {}): Promise<SaveOutcome> {
+  return enqueue(() => saveCommentNow(post, fields))
+}
+
+async function saveCommentNow(post: LinkedInPost, fields: CommentFields): Promise<SaveOutcome> {
+  // The URL is the identity WHEN THERE IS ONE, and a minted `local:…` when there is not. It used to
+  // be required, which made every comment drafted from a pasted post or from the take alone
+  // unfileable — the draft existed, passed both checks, and had nowhere to go.
+  const canonical = postUrl(post?.postUrl)?.canonical ?? null
+  const identity = canonical
+    ?? (fields.key && isLocalCommentKey(fields.key) ? fields.key : mintLocalKey())
+
+  const env = await readEnvelope()
+  const prev = env.byPost[identity]
+  const now = Date.now()
+  const record: CommentRecord = {
+    key: identity,
+    postUrl: canonical ?? '',
+    id: prev?.id ?? null,
+    pendingRef: prev?.pendingRef ?? null,
+    author: post.author ?? prev?.author ?? null,
+    postText: post.text ?? prev?.postText ?? '',
+    take: fields.take ?? prev?.take ?? '',
+    draft: fields.draft ?? prev?.draft ?? '',
+    finalText: fields.finalText ?? prev?.finalText ?? '',
+    posted: fields.posted ?? prev?.posted ?? false,
+    postedAt: prev?.postedAt ?? null,
+    updatedAt: now,
+    lastOutcome: prev?.lastOutcome ?? null,
+  }
+  if (fields.posted === true) record.postedAt = (fields.postedAt ?? new Date()).toISOString()
+  if (fields.posted === false) record.postedAt = null
+
+  const row = columnsKnown({
+    post_url: canonical ?? '',
+    post_author: post.author,
+    post_author_url: post.authorUrl,
+    post_text: post.text,
+    my_take: record.take,
+    draft: record.draft,
+    final_text: record.finalText,
+  }, COMMENT_COLUMNS)
+  // The one place this writer sends a literal false and a literal null, and only because the human
+  // asked: un-marking a comment as posted must actually clear posted_at, or the log would keep a
+  // timestamp for something it no longer claims happened.
+  if (fields.posted !== undefined) {
+    row.posted = fields.posted
+    row.posted_at = record.postedAt
+  }
+
+  // The take and the draft survive the popup closing even when the hub never hears about them.
+  env.byPost[identity] = record
+  await writeEnvelope(env)
+
+  try {
+    let id = record.id
+    if (!id && record.pendingRef) {
+      // A first save is still queued. Flush once: if it landed while we were away we now know the id
+      // and this becomes an ordinary update.
+      const landed = await settle(record.pendingRef)
+      if (landed.status === 'sent' && typeof landed.row?.id === 'string') {
+        id = landed.row.id
+        record.id = id
+        record.pendingRef = null
+      } else if (landed.status === 'queued') {
+        // Inserting again here is how one post becomes two rows. It does not happen: the newest text
+        // is already stored locally, and the note says exactly what to do about it.
+        record.lastOutcome = 'queued'
+        env.byPost[identity] = record
+        await writeEnvelope(env)
+        return {
+          status: 'queued', commentId: null, row, record,
+          note: `Your first save for this post is still waiting for the hub (${landed.note}) — this version is kept here and no second row was made. Start the hub with \`make serve\` and press Save again.`,
+        }
+      } else {
+        record.pendingRef = null                       // dead or unanswered: that write is not coming back
+      }
+    }
+    // A cleared local store is not a new comment — as long as there is a URL to ask about. Without
+    // one the hub has nothing to recognise the row by, so this is the case where the memory really
+    // is the only link, and the note below says so.
+    if (!id && canonical) id = await remoteId(canonical)
+
+    const ref = id
+      ? await hubUpdate('comments', id, row, { flush: false })
+      : await hubInsert('comments', row, { flush: false })
+    const done = await settle(ref)
+    const storedId = typeof done.row?.id === 'string' ? done.row.id : null
+
+    if (done.status === 'sent') {
+      record.id = storedId ?? id
+      record.pendingRef = null
+    } else if (done.status === 'queued' && !id) {
+      record.pendingRef = ref                          // remember it, so a second press does not insert again
+    } else if (done.status === 'dead' && !id) {
+      record.pendingRef = null
+    }
+    record.lastOutcome = done.status
+    env.byPost[identity] = record
+    await writeEnvelope(env)
+
+    const what = record.posted ? 'Comment saved and marked posted' : id ? 'Comment updated' : 'Comment saved'
+    // Said once, on the save that actually made the row: a comment with no post URL is filed, but
+    // this machine's memory is the only thing linking it to this draft.
+    const caveat = !canonical && !id
+      ? ' It has no post URL, so it is filed under a local id — this browser is the only thing that'
+        + ' knows which row it is. Read the post if you want it recognised anywhere else.'
+      : ''
+    if (done.status === 'sent') return { status: 'sent', commentId: record.id, row, record, note: `${what}.${caveat}` }
+    if (done.status === 'dead') return { status: 'dead', commentId: null, row, record, note: `Comment refused by the hub — ${done.note}` }
+    if (done.status === 'queued') return { status: 'queued', commentId: null, row, record, note: `Comment queued for the hub (${done.note}) — it is kept here meanwhile.` }
+    return { status: 'error', commentId: null, row, record, note: `Comment not saved — ${done.note}.` }
+  } catch (e) {
+    record.lastOutcome = 'error'
+    env.byPost[identity] = record
+    await writeEnvelope(env)
+    return { status: 'error', commentId: null, row, record, note: `Comment not saved — ${e instanceof Error ? e.message : String(e)}` }
+  }
+}
+
+/**
+ * He copied the comment, posted it on LinkedIn himself, and pressed the button. That press is the
+ * ONLY posted detection there is: nothing watches the page, nothing polls, and no route in this
+ * product posts a comment.
+ */
+export function recordPosted(post: LinkedInPost, finalText: string, when: Date = new Date()): Promise<SaveOutcome> {
+  return saveComment(post, { finalText, posted: true, postedAt: when })
+}

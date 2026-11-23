@@ -1,0 +1,387 @@
+// ---------------------------------------------------------------------------
+// Shared vocabulary for FlashFiller. Sections referenced are from README.MD.
+// ---------------------------------------------------------------------------
+
+// ---- Field detection (Section 5) ------------------------------------------
+
+export type FieldKind =
+  | 'text'
+  | 'email'
+  | 'tel'
+  | 'url'
+  | 'number'
+  | 'date'
+  | 'textarea'
+  | 'select'
+  | 'radio'
+  | 'checkbox'
+  | 'custom-dropdown'
+  | 'contenteditable'
+  | 'file'
+  | 'password'
+
+export interface FieldOption {
+  value: string
+  text: string
+}
+
+/** Everything the detector could learn about one control, DOM-free. */
+export interface SignalBundle {
+  fieldId: string
+  kind: FieldKind
+  label: string
+  placeholder: string
+  autocomplete: string
+  name: string
+  id: string
+  dataAttrs: string[]
+  required: boolean
+  options: FieldOption[]
+  sectionContext: string
+  /** 0-based position within a repeated section ("Work Experience 2" → 1);
+   *  undefined when the field isn't inside a numbered repeating block. */
+  sectionIndex?: number
+  /** Library-controlled date widget — needs its own fill path (setting the
+   *  input's value gets reverted by the component's internal state). */
+  dateWidget?: 'react-datepicker'
+  /** Which repeated-block family the field sits in — keeps education dates
+   *  from filling with work-history dates and vice versa. */
+  sectionKind?: 'work' | 'education'
+  /** "list", "each", "last 3" … — hints at composite content (Section 5/6). */
+  multiplicityCue: boolean
+  normalizedQuestion: string
+  /** Label + placeholder + section context, pre-normalization. */
+  rawText: string
+  /** Which source won the label cascade — capture trusts 'label', treats
+   *  'placeholder'/'identifier'/'section' as weak question keys. Optional in
+   *  the type (absent = treat as label) so test factories stay valid. */
+  questionSource?: 'label' | 'placeholder' | 'identifier' | 'section'
+  /** Runner-up label candidates from the cascade (capture stores them as
+   *  aliases — free cross-site matching material). */
+  labelAliases?: string[]
+  filled: boolean
+  /** Legal/consent checkbox — surfaced, never auto-checked (Section 8/13). */
+  consentLike: boolean
+  /** Certification-of-truth / at-will acknowledgment checkbox — the ONE
+   *  consent class the user chose to auto-tick. All other consent stays
+   *  chip-only. */
+  certificationLike?: boolean
+  /** EEO/demographic field — surfaced, never auto-filled (Section 13). */
+  eeoLike: boolean
+  /** Field sits on an account-creation/sign-in form (a password input shares
+   *  its form, or the page is a small auth page) — email/username fields get
+   *  the dedicated ACCOUNT email instead of the application contact email. */
+  authContext?: boolean
+  /** File inputs: what the field/zone asks for — routes document matching
+   *  ("resume" | "coverLetter"); 'other' = generic attachments zone. */
+  docCue?: 'resume' | 'coverLetter' | 'other'
+  /** File inputs: the accept attribute, verbatim — pickDocument refuses to
+   *  hand a .docx to an accept=".pdf" input (matcher is DOM-free). */
+  accept?: string
+}
+
+// ---- Profile & knowledge base (Section 9) ----------------------------------
+
+export interface WorkHistoryEntry {
+  company: string
+  title: string
+  startDate: string
+  endDate: string
+  location: string
+  description: string
+}
+
+export interface EducationEntry {
+  institution: string
+  degree: string
+  field: string
+  startDate: string
+  endDate: string
+}
+
+export interface Profile {
+  firstName: string
+  lastName: string
+  email: string
+  phone: string
+  address: {
+    line1: string
+    line2: string
+    city: string
+    state: string
+    postalCode: string
+    country: string
+  }
+  links: {
+    linkedin: string
+    github: string
+    portfolio: string
+    website: string
+  }
+  /** Account-creation credentials for ATS portals (Workday & co require an
+   *  account before applying). The account EMAIL is deliberately separate
+   *  from the application contact email. Password lives in local extension
+   *  storage only — never captured, never shown in chips/debug output. */
+  accountEmail: string
+  accountPassword: string
+  /** ISO date ("2026-09-01") for earliest-start-date questions; date inputs
+   *  get it verbatim, text inputs a long form ("September 1, 2026"). */
+  earliestStartDate: string
+  /** Status text ("US Citizen", "H-1B") for what-is-your-status questions. */
+  workAuthorization: string
+  /** Yes/No answer for are-you-authorized-to-work questions. */
+  authorizedToWork: boolean
+  requiresSponsorship: boolean
+  /** "Have you previously worked for this company?" — generic default. */
+  previouslyEmployedHere: boolean
+  willingToRelocate: boolean
+  noticePeriod: string
+  desiredSalary: string
+  pronouns: string
+  workHistory: WorkHistoryEntry[]
+  education: EducationEntry[]
+  /** Voluntary self-identification answers (Section 13). */
+  eeo: {
+    gender: string
+    ethnicity: string
+    veteranStatus: string
+    disabilityStatus: string
+  }
+}
+
+export type AnswerType = 'text' | 'profile' | 'composite' | 'notify'
+export type QAStatus = 'active' | 'needs_review'
+export type QASource = 'training' | 'captured' | 'import' | 'inferred'
+
+export interface QAEntry {
+  id: string
+  question: string
+  aliases: string[]
+  /** May contain template variables like {{company}} (Section 7). For
+   *  answerType 'notify' this is guidance shown to the user, never filled. */
+  answer: string
+  answerType: AnswerType
+  /** Alternate answers tried in order when the primary places on no option
+   *  ("Industrial Engineering" → "Engineering"; "F-1" → "OPT"). */
+  fallbacks?: string[]
+  /** 'judge': option placement for this question belongs to the OpenAI judge
+   *  ALONE — lexical picking is disabled wherever this question matches
+   *  (whatever tier answered), and a judge decline is an honest chip, never
+   *  a lexical guess. Optional in the TYPE (zod default 'auto'). */
+  answerMode?: 'auto' | 'judge'
+  /** For composite: iteration template over a profile array (Section 9). */
+  answerTemplate: string | null
+  /** For profile-backed: e.g. "profile.noticePeriod". */
+  mapsTo: string | null
+  variables: string[]
+  /** Empty = universal (Section 6). */
+  personas: string[]
+  tags: string[]
+  fieldType: string
+  /** Option texts the field offered when this was captured (select/radio/
+   *  checkbox/custom-dropdown) — reviewed and classified in the Options tab. */
+  options: string[]
+  status: QAStatus
+  source: QASource
+  /** Page context snapshot at capture time — powers "generalize" (Section 11). */
+  captureContext?: PageContext | null
+  /** Hostname the entry is pinned to (branded answers like "mcwane.com");
+   *  null/absent = universal. Foreign-site matching skips scoped entries.
+   *  Optional in the TYPE (zod defaults fill parsed data) so legacy literals
+   *  and test factories stay valid. */
+  siteScope?: string | null
+  /** Why the entry sits in the Review queue ("Captured on …", "Filled wrong
+   *  value on …"). Cleared on approve. */
+  reviewNote?: string
+  /** Last time a validation pass judged a fill from this entry 'wrong'. */
+  lastWrongAt?: number | null
+  /** Validation-confirmed correct fills since approval — the graduation
+   *  counter (okCount ≥ 3 with no wrongs = trusted, normal thresholds). */
+  okCount?: number
+  /** Canonical-mismatch wrong verdicts since approval (two-strike demotion). */
+  wrongCount?: number
+  createdAt: number
+  updatedAt: number
+}
+
+/** User-classified equivalence group: option texts that mean the same thing
+ *  across differently-worded forms ("Yes" ≈ "Yes, I am authorized to work").
+ *  Members of one set are interchangeable when placing an answer on a
+ *  form's options. */
+export interface OptionSet {
+  id: string
+  label: string
+  options: string[]
+}
+
+export interface SemanticSettings {
+  enabled: boolean
+  provider: string
+  apiKeyRef: string | null
+  /** OpenAI model for the semantic judge (default gpt-4o-mini). */
+  model: string
+}
+
+export interface Settings {
+  autoFillThreshold: number
+  suggestThreshold: number
+  overwriteFilled: boolean
+  enabledDomains: string[]
+  /** Per-host activation veto (exact host + subdomains), checked before any
+   *  enablement path — the OFF switch for fingerprint-activated vanity
+   *  domains, whose enablement has no enabledDomains entry to remove. */
+  disabledDomains: string[]
+  captureLoopEnabled: boolean
+  semanticMatching: SemanticSettings
+  fillDelayMs: number
+  personas: string[]
+  /** null = universal only; may be auto-set from job title (Section 6). */
+  activePersona: string | null
+  autoInferPersona: boolean
+  onboardingCompleted: boolean
+  /** Seed question ids the user marked "Not applicable" (Section 10). */
+  suppressedSeedIds: string[]
+  /** Matched stored documents attach to file inputs automatically; off =
+   *  suggestion chip instead (Accept attaches). The user curated these bytes
+   *  personally, so ON is the default. */
+  autoAttachDocuments: boolean
+}
+
+export interface StoreData {
+  schemaVersion: number
+  profile: Profile
+  qa: QAEntry[]
+  optionSets: OptionSet[]
+  settings: Settings
+}
+
+// ---- Seed catalog (Section 9/10) -------------------------------------------
+
+export type SeedAnswerType = 'profile' | 'freeText' | 'composite' | 'notify'
+
+export interface SeedQuestion {
+  id: string
+  category: string
+  question: string
+  aliases: string[]
+  fieldType: string
+  answerType: SeedAnswerType
+  mapsTo: string | null
+  answerTemplate: string | null
+  variables: string[]
+  autofillByDefault: boolean
+  /** For 'notify' seeds: what the chip tells the user ("Preferred locations:
+   *  NC/NY/TX/NJ/CA/WI — pick per posting"). */
+  guidance?: string
+  /** Alternate answers tried in order when the primary places on no option. */
+  fallbacks?: string[]
+}
+
+export interface SeedCatalog {
+  schemaVersion: number
+  note: string
+  categories: { id: string; label: string }[]
+  questions: SeedQuestion[]
+}
+
+// ---- Page context & matching (Sections 6/7) --------------------------------
+
+export type ContextSource = 'jsonld' | 'meta' | 'adapter' | 'title' | 'none'
+
+export interface PageContext {
+  company: string | null
+  role: string | null
+  location: string | null
+  source: ContextSource
+}
+
+export type MatchAction = 'autofill' | 'suggest' | 'ignore'
+
+export interface MatchResult {
+  fieldId: string
+  /** Answer after variable resolution; null until resolved at fill time. */
+  resolvedAnswer: string | null
+  rawAnswerTemplate: string
+  confidence: number
+  source: 'profile' | `qa:${string}` | `document:${string}`
+  persona?: string
+  unresolvedVars: string[]
+  chosenOptionValue?: string
+  /** Multi-select (checkbox group): every option text the answer placed. */
+  chosenOptionValues?: string[]
+  action: MatchAction
+  needsReview: boolean
+  composite: boolean
+  matchedKey?: string
+  /** Custom dropdown with no stored answer: the option list only exists after
+   *  the popup opens, so the judge picks AT FILL TIME (fillCustomDropdown). */
+  inferAtFill?: boolean
+  /** How the judge produced this match — drives post-fill learning:
+   *  'drift' = a stored entry matched under different wording (→ new alias);
+   *  'inferred' = the answer came from the judge, nothing stored (→ new entry). */
+  provenance?: 'drift' | 'inferred'
+  /** Never fill — show the stored guidance so the user acts ("Preferred
+   *  locations: … — pick per posting"). */
+  notify?: boolean
+  /** Alternate answers tried in order at option-placement/fill time. */
+  answerFallbacks?: string[]
+  /** A judge-mode entry matched this question: the OpenAI judge alone places
+   *  the answer on options — lexical picking is off for this fill. */
+  judgeOnly?: boolean
+}
+
+// ---- Messaging --------------------------------------------------------------
+
+/** One expandable branch of a hierarchical dropdown, harvested at fill time:
+ *  the category row's text plus the sub-options its sub-level revealed. */
+export interface CascadeCategory {
+  label: string
+  options: string[]
+}
+
+export type Message =
+  | { type: 'SCAN_ACTIVE_TAB' }
+  | { type: 'CAPTURE_COUNT_CHANGED' }
+  | { type: 'OPEN_OPTIONS'; tab?: string }
+  | { type: 'PING' }
+  /** Trusted-input fallback: dispatch a REAL click at main-frame viewport
+   *  coordinates via chrome.debugger (CDP) — for widgets that ignore
+   *  synthetic events. */
+  | { type: 'TRUSTED_CLICK'; x: number; y: number }
+  /** Trusted typing into the focused element (CDP Input.insertText) — for
+   *  controlled inputs that discard synthetic keystrokes. */
+  | { type: 'TRUSTED_TYPE'; text: string }
+  /** Ask the configured OpenAI judge which option matches the answer's MEANING. */
+  | { type: 'SEMANTIC_CHOOSE'; answer: string; options: string[] }
+  /** Batch-embed texts (text-embedding-3-small, 256 dims) — the content
+   *  script caches vectors locally so each string is embedded ONCE ever. */
+  | { type: 'SEMANTIC_EMBED'; texts: string[] }
+  /** Which stored question asks the same thing as this form question? */
+  | { type: 'SEMANTIC_MATCH_QUESTION'; question: string; candidates: string[] }
+  /** No stored answer: infer the right option from the applicant's facts. */
+  | { type: 'SEMANTIC_ANSWER'; question: string; options: string[]; facts: string }
+  /** Hierarchical dropdown ("How did you hear about us?"): ONE call over the
+   *  harvested category → sub-option tree; the judge returns the primary +
+   *  sub-option pair, or declines. */
+  | { type: 'SEMANTIC_CASCADE'; question: string; answer: string; facts: string; categories: CascadeCategory[] }
+  /** Draft a short free-text answer from the applicant's facts (open-ended
+   *  questions). The reply is a suggestion chip, never a silent fill. */
+  | { type: 'SEMANTIC_TEXT'; question: string; facts: string; kind: 'text' | 'textarea' }
+
+export interface FillReport {
+  filled: number
+  suggested: number
+  skipped: number
+}
+
+/** One frame's scan outcome — aggregated across frames by the service worker. */
+export interface ScanReport {
+  detected: number
+  matched: number
+  skippedFilled: number
+}
+
+export interface ScanResponse extends Partial<ScanReport> {
+  ok: boolean
+  error?: string
+}

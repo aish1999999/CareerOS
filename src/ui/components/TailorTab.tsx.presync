@@ -1,0 +1,370 @@
+import { useEffect, useRef, useState } from 'react'
+import { STAGE_LABELS, type HealthResponse, type TailorJob, type TailorResult } from '@contract/types'
+import { captureActiveTabJd, toRequest, type CapturedJd } from '@/lib/jd-capture'
+import {
+  cancelJob,
+  checkHealth,
+  estimateCostUsd,
+  getTailorConfig,
+  pollUntilDone,
+  saveResultAsDocument,
+  setTailorConfig,
+  startTailor,
+} from '@/lib/tailor'
+
+// ---------------------------------------------------------------------------
+// Tailor tab — generate a résumé for the posting in the active tab.
+//
+// Everything here is opt-in and honest by default:
+//   * service not running  → says so, with the command to start it. No retries.
+//   * no API key / stale vault → surfaced from /health BEFORE the user commits
+//     to a paid run, not discovered halfway through.
+//   * every run costs money → estimate shown, confirmation required.
+//   * gate flagged the bullets → warning stays on screen and the save button
+//     says so; the document is never quietly treated as finished work.
+//
+// The generated .docx lands in the existing document store, so from the moment
+// it is saved the rest of FlashFiller treats it exactly like a hand-uploaded
+// résumé: pickDocument matches it, fillFileUpload attaches it, validate checks.
+// ---------------------------------------------------------------------------
+
+function costLabel(usd: number): string {
+  return `$${usd.toFixed(2)}`
+}
+
+export function TailorTab() {
+  const [health, setHealth] = useState<HealthResponse | null>(null)
+  const [checking, setChecking] = useState(true)
+  const [token, setToken] = useState('')
+  const [tokenSaved, setTokenSaved] = useState(false)
+
+  const [captured, setCaptured] = useState<CapturedJd | null>(null)
+  const [role, setRole] = useState('')
+  const [company, setCompany] = useState('')
+  const [jdText, setJdText] = useState('')
+
+  const [job, setJob] = useState<TailorJob | null>(null)
+  const [result, setResult] = useState<TailorResult | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [status, setStatus] = useState<string | null>(null)
+  const [running, setRunning] = useState(false)
+  const [makeDefault, setMakeDefault] = useState(true)
+  const [showToken, setShowToken] = useState(false)
+  const abort = useRef<AbortController | null>(null)
+
+  const refreshHealth = async () => {
+    setChecking(true)
+    try {
+      setHealth(await checkHealth())
+      setError(null)
+    } catch (e) {
+      setHealth(null)
+      setError(e instanceof Error ? e.message : String(e))
+    }
+    setChecking(false)
+  }
+
+  useEffect(() => {
+    void getTailorConfig().then((c) => setToken(c.token))
+    void refreshHealth()
+    return () => abort.current?.abort()
+  }, [])
+
+  const saveToken = async () => {
+    await setTailorConfig({ token: token.trim() })
+    setTokenSaved(true)
+    setTimeout(() => setTokenSaved(false), 3000)
+    await refreshHealth()
+  }
+
+  const capture = async () => {
+    setError(null)
+    try {
+      const cap = await captureActiveTabJd()
+      setCaptured(cap)
+      setRole(cap.role ?? '')
+      setCompany(cap.company ?? '')
+      setJdText(cap.jdText)
+      setStatus(
+        cap.jdText.length > 200
+          ? `Captured ${cap.jdText.length.toLocaleString()} characters (${cap.source}).`
+          : 'Could not find a description on that page — paste it below.',
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+    setTimeout(() => setStatus(null), 6000)
+  }
+
+  const run = async (dryRun: boolean) => {
+    setError(null)
+    setResult(null)
+    setJob(null)
+
+    const built = toRequest(captured ?? { role: null, company: null, location: null, jdText: '', url: null, source: 'none' },
+      { role, company, jdText })
+    if ('problem' in built) {
+      setError(built.problem)
+      return
+    }
+
+    if (!dryRun) {
+      const ok = confirm(
+        `Generate a tailored résumé for "${built.request.role}"?\n\n` +
+          `This runs the full pipeline against your Anthropic key — roughly ${costLabel(estimateCostUsd())}, ` +
+          `a few minutes. The budget ceiling stops it going further.`,
+      )
+      if (!ok) return
+    }
+
+    setRunning(true)
+    abort.current = new AbortController()
+    try {
+      const started = await startTailor({
+        ...built.request,
+        options: { ...(built.request.options ?? {}), dryRun },
+      })
+      setJob(started)
+      const finished = await pollUntilDone(started.jobId, setJob, { signal: abort.current.signal })
+      if (finished.status === 'done' && finished.result) {
+        setResult(finished.result)
+        setStatus(dryRun ? 'Preflight complete.' : `Done — actual spend ${costLabel(finished.costUsd ?? 0)}.`)
+      } else if (finished.status === 'failed') {
+        setError(finished.error ?? 'The run failed.')
+      } else if (finished.status === 'cancelled') {
+        setStatus('Run cancelled.')
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+    setRunning(false)
+  }
+
+  const stop = async () => {
+    if (job) await cancelJob(job.jobId).catch(() => null)
+    abort.current?.abort()
+    setRunning(false)
+  }
+
+  const save = async () => {
+    if (!result) return
+    try {
+      const saved = await saveResultAsDocument(result, { makeDefault })
+      setStatus(
+        makeDefault
+          ? `Saved "${saved.name}" and starred it — this is the résumé that will attach next.`
+          : `Saved "${saved.name}". Another résumé is still starred, so star this one in Documents ` +
+            'if you want it attached instead.',
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  // --- service down ---------------------------------------------------------
+  if (!checking && !health) {
+    return (
+      <div>
+        <h3>Tailor</h3>
+        <p className="muted">
+          Generates a résumé tailored to a specific posting, then drops it straight into your
+          Documents so it attaches like any other stored résumé.
+        </p>
+        <div className="note" style={{ marginTop: 10 }}>
+          <strong>The Tailor service isn’t running.</strong>
+          <div className="sub" style={{ marginTop: 6 }}>
+            Start it from the project root:
+            <pre style={{ margin: '6px 0', whiteSpace: 'pre-wrap' }}>make serve</pre>
+            Nothing is sent anywhere until it is running — FlashFiller does not retry in the
+            background.
+          </div>
+        </div>
+        {error && <div className="note warn" style={{ marginTop: 8 }}>{error}</div>}
+        <div style={{ marginTop: 10, display: 'flex', gap: 8, alignItems: 'center' }}>
+          <input
+            type="password"
+            placeholder="Service token"
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            style={{ flex: 1 }}
+          />
+          <button className="btn small" onClick={() => void saveToken()}>Save</button>
+          <button className="btn small primary" onClick={() => void refreshHealth()}>Retry</button>
+        </div>
+        {tokenSaved && <div className="note" style={{ marginTop: 6 }}>Token saved.</div>}
+      </div>
+    )
+  }
+
+  const blocked = health ? !health.apiKeyPresent || !health.vaultReady : false
+  const stage = job?.stage ? (STAGE_LABELS[job.stage] ?? job.stage) : null
+
+  return (
+    <div>
+      <h3>Tailor</h3>
+      <p className="muted">
+        Reads the posting in the active tab, generates STAR bullets against your vault, renders an
+        ATS-clean .docx, and saves it to Documents. Never submits anything.
+      </p>
+
+      {checking && <div className="note">Checking the service…</div>}
+
+      {/* Service + token row.
+          `/health` is deliberately public so this tab can report the service is
+          up before anything is configured — which meant a RUNNING service
+          rendered this view with the token field nowhere on screen, and the
+          only way to reach it was to stop the service. The token belongs here,
+          reachable whatever the connection state. */}
+      {health && (
+        <div className="note" style={{ marginTop: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <span>Service connected{health.activeJobs ? ` · ${health.activeJobs} job running` : ''}</span>
+            <span style={{ flex: 1 }} />
+            <button className="btn small" onClick={() => setShowToken((v) => !v)}>
+              {token ? 'Change token' : 'Set token'}
+            </button>
+          </div>
+
+          {(showToken || !token) && (
+            <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center' }}>
+              <input
+                type="password"
+                placeholder="Service token"
+                value={token}
+                onChange={(e) => setToken(e.target.value)}
+                style={{ flex: 1 }}
+              />
+              <button className="btn small primary" onClick={() => void saveToken()}>
+                Save
+              </button>
+            </div>
+          )}
+
+          {!token && (
+            <div className="sub" style={{ marginTop: 6 }}>
+              Required before <strong>Generate</strong> — without it the service returns 401.
+              It is printed when <code>make serve</code> starts, and cached in{' '}
+              <code>apps/mapper/.tailor-token</code>.
+            </div>
+          )}
+          {tokenSaved && <div className="sub" style={{ marginTop: 6 }}>Token saved.</div>}
+        </div>
+      )}
+
+      {health && blocked && (
+        <div className="note warn" style={{ marginTop: 8 }}>
+          <strong>Not ready to run.</strong>
+          <ul style={{ margin: '6px 0 0 16px' }}>
+            {!health.apiKeyPresent && <li>ANTHROPIC_API_KEY is not set — paid runs are refused.</li>}
+            {!health.vaultReady && <li>{health.vaultDetail}</li>}
+          </ul>
+        </div>
+      )}
+
+      <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button className="btn primary" onClick={() => void capture()} disabled={running}>
+          Read this page
+        </button>
+        <button className="btn" onClick={() => void run(true)} disabled={running}>
+          Preflight (free)
+        </button>
+        <button className="btn" onClick={() => void run(false)} disabled={running || blocked}>
+          Generate — ~{costLabel(estimateCostUsd())}
+        </button>
+        {running && <button className="btn small danger" onClick={() => void stop()}>Stop</button>}
+      </div>
+
+      {status && <div className="note" style={{ marginTop: 8 }}>{status}</div>}
+      {error && <div className="note warn" style={{ marginTop: 8 }}>{error}</div>}
+
+      <div style={{ marginTop: 12, display: 'grid', gap: 8 }}>
+        <label className="label">
+          Job title
+          <input value={role} onChange={(e) => setRole(e.target.value)} placeholder="Junior Manufacturing Engineer" />
+        </label>
+        <label className="label">
+          Company <span className="muted">(optional)</span>
+          <input value={company} onChange={(e) => setCompany(e.target.value)} />
+        </label>
+        <label className="label">
+          Job description
+          <textarea
+            rows={8}
+            value={jdText}
+            onChange={(e) => setJdText(e.target.value)}
+            placeholder="Captured from the page, or paste it here."
+          />
+          <span className="sub">
+            {jdText.length.toLocaleString()} characters
+            {captured?.source && captured.source !== 'none' ? ` · via ${captured.source}` : ''}
+            {jdText.length > 0 && jdText.length < 200 ? ' · too short to run' : ''}
+          </span>
+        </label>
+      </div>
+
+      {job && running && (
+        <div className="note" style={{ marginTop: 12 }}>
+          <strong>{stage ?? 'Working'}…</strong>
+          <div className="sub">
+            {Math.round((job.progress ?? 0) * 100)}% · job {job.jobId}
+            {job.costUsd ? ` · ${costLabel(job.costUsd)} so far` : ''}
+          </div>
+        </div>
+      )}
+
+      {result && (
+        <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <strong>{result.bullets.length} bullets</strong>
+            <span className="muted">· {costLabel(result.costUsd)}</span>
+            {result.document && (
+              <button className="btn small primary" onClick={() => void save()}>
+                {result.needsHumanReview ? 'Save anyway →  Documents' : 'Save to Documents'}
+              </button>
+            )}
+          </div>
+
+          {result.document && (
+            <label
+              className="muted"
+              style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 6, cursor: 'pointer' }}
+              title="Documents only auto-star the first résumé you store. Without this, an older résumé stays the one that attaches."
+            >
+              <input
+                type="checkbox"
+                checked={makeDefault}
+                onChange={(e) => setMakeDefault(e.target.checked)}
+              />
+              Make this the résumé that attaches (★)
+            </label>
+          )}
+
+          {result.needsHumanReview && (
+            <div className="note warn" style={{ marginTop: 8 }}>
+              <strong>Flagged for review.</strong> {result.reviewReason ?? 'Some bullets did not clear the gate.'}
+              <div className="sub" style={{ marginTop: 4 }}>
+                Read them before this goes to an employer — the pipeline is telling you it is not confident.
+              </div>
+            </div>
+          )}
+
+          <ol style={{ margin: '10px 0 0 18px', padding: 0 }}>
+            {result.bullets.map((b) => (
+              <li key={b.slot} style={{ marginBottom: 6 }}>
+                <span className="sub">[{b.category}]</span>{' '}
+                {b.text}
+                {b.needs_human_review && <span className="warn"> ⚠</span>}
+              </li>
+            ))}
+          </ol>
+
+          {result.runDir && (
+            <p className="muted" style={{ marginTop: 8 }}>
+              Full run artifacts: <code>{result.runDir}</code>
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}

@@ -1,0 +1,758 @@
+import { useEffect, useRef, useState } from 'react'
+import {
+  TAILOR_BASE_URL,
+  STAGE_LABELS,
+  type FinalizeRequest,
+  type HealthResponse,
+  type TailorJob,
+  type TailorResult,
+  type TailorSkillLine,
+} from '@contract/types'
+import { captureActiveTabJd, toRequest, type CapturedJd } from '@/lib/jd-capture'
+import {
+  cancelJob,
+  checkHealth,
+  downloadCoverLetterDocument,
+  downloadResultDocument,
+  estimateCostUsd,
+  estimateCoverLetterCostUsd,
+  finalizeJob,
+  getTailorConfig,
+  pollCoverLetter,
+  pollUntilDone,
+  requestCoverLetter,
+  saveCoverLetterAsDocument,
+  saveResultAsDocument,
+  setTailorConfig,
+  startTailor,
+} from '@/lib/tailor'
+
+// ---------------------------------------------------------------------------
+// Tailor tab — generate a résumé for the posting in the active tab.
+//
+// Everything here is opt-in and honest by default:
+//   * service not running  → says so, with the command to start it. No retries.
+//   * no API key / stale vault → surfaced from /health BEFORE the user commits
+//     to a paid run, not discovered halfway through.
+//   * every run costs money → estimate shown, confirmation required.
+//   * gate flagged the bullets → warning stays on screen and the save button
+//     says so; the document is never quietly treated as finished work.
+//
+// The generated .docx lands in the existing document store, so from the moment
+// it is saved the rest of FlashFiller treats it exactly like a hand-uploaded
+// résumé: pickDocument matches it, fillFileUpload attaches it, validate checks.
+// ---------------------------------------------------------------------------
+
+function costLabel(usd: number): string {
+  return `$${usd.toFixed(2)}`
+}
+
+export function TailorTab() {
+  const [health, setHealth] = useState<HealthResponse | null>(null)
+  const [checking, setChecking] = useState(true)
+  const [token, setToken] = useState('')
+  const [baseUrl, setBaseUrl] = useState(TAILOR_BASE_URL)
+  const [tokenSaved, setTokenSaved] = useState(false)
+  const [urlError, setUrlError] = useState<string | null>(null)
+
+  const [captured, setCaptured] = useState<CapturedJd | null>(null)
+  const [role, setRole] = useState('')
+  const [company, setCompany] = useState('')
+  const [jdText, setJdText] = useState('')
+
+  const [job, setJob] = useState<TailorJob | null>(null)
+  const [result, setResult] = useState<TailorResult | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [status, setStatus] = useState<string | null>(null)
+  const [running, setRunning] = useState(false)
+  const [makeDefault, setMakeDefault] = useState(true)
+  const [showToken, setShowToken] = useState(false)
+  const abort = useRef<AbortController | null>(null)
+
+  // Review-step state: the user's editable copy of the draft. Nothing is
+  // rendered until these are approved — that is the whole point of the step.
+  const [lastDryRun, setLastDryRun] = useState(false)
+  const [editSummary, setEditSummary] = useState('')
+  const [editSkills, setEditSkills] = useState<TailorSkillLine[]>([])
+  const [editBullets, setEditBullets] = useState<Record<number, string>>({})
+  const [finalizing, setFinalizing] = useState(false)
+
+  // Cover-letter state (v5): generated on demand by its own button, never as
+  // part of the run — the user opts into the extra spend explicitly.
+  const [letterBusy, setLetterBusy] = useState(false)
+  const [letterStatus, setLetterStatus] = useState<string | null>(null)
+
+  const beginReview = (r: TailorResult) => {
+    setEditSummary(r.summary ?? '')
+    setEditSkills((r.skills ?? []).map((s) => ({ ...s })))
+    setEditBullets(Object.fromEntries(r.bullets.map((b) => [b.slot, b.text])))
+  }
+
+  const refreshHealth = async () => {
+    setChecking(true)
+    try {
+      setHealth(await checkHealth())
+      setError(null)
+    } catch (e) {
+      setHealth(null)
+      setError(e instanceof Error ? e.message : String(e))
+    }
+    setChecking(false)
+  }
+
+  useEffect(() => {
+    void getTailorConfig().then((c) => {
+      setToken(c.token)
+      setBaseUrl(c.baseUrl)
+    })
+    void refreshHealth()
+    return () => abort.current?.abort()
+  }, [])
+
+  const saveService = async () => {
+    setUrlError(null)
+    try {
+      // setTailorConfig validates the address before it ever reaches storage.
+      await setTailorConfig({ baseUrl: baseUrl.trim(), token: token.trim() })
+    } catch (e) {
+      setUrlError(e instanceof Error ? e.message : String(e))
+      return
+    }
+    setTokenSaved(true)
+    setTimeout(() => setTokenSaved(false), 3000)
+    await refreshHealth()
+  }
+
+  // Rendered by BOTH the offline and connected branches. Address only in the
+  // connected view would be a dead end: point it somewhere unreachable and you
+  // are offline, with no way to correct it. A plain function, NOT a nested
+  // component — a component defined in render remounts each pass and drops
+  // focus on every keystroke.
+  const serviceFields = () => (
+    <>
+      <label className="label" style={{ display: 'block', marginTop: 8 }}>
+        Service address
+        <input
+          type="text"
+          placeholder={TAILOR_BASE_URL}
+          value={baseUrl}
+          onChange={(e) => setBaseUrl(e.target.value)}
+          spellCheck={false}
+          autoComplete="off"
+          autoCapitalize="off"
+          autoCorrect="off"
+        />
+        <span className="sub">
+          Loopback, LAN or tailnet only — <code>127.0.0.1</code>, <code>192.168.x.x</code>,{' '}
+          <code>10.x.x.x</code>, <code>100.64–127.x.x</code> or a <code>.ts.net</code> name.
+          Public addresses are refused.
+        </span>
+      </label>
+      <label className="label" style={{ display: 'block', marginTop: 6 }}>
+        Service token
+        <input
+          type="password"
+          placeholder="from `make serve`"
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+          autoComplete="off"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck={false}
+        />
+      </label>
+      <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+        <button className="btn small primary" onClick={() => void saveService()}>Save</button>
+        <button className="btn small" onClick={() => void refreshHealth()}>Test connection</button>
+      </div>
+      {urlError && <div className="note warn" style={{ marginTop: 8 }}>{urlError}</div>}
+      {tokenSaved && <div className="sub" style={{ marginTop: 6 }}>Saved.</div>}
+    </>
+  )
+
+  const capture = async () => {
+    setError(null)
+    try {
+      const cap = await captureActiveTabJd()
+      setCaptured(cap)
+      setRole(cap.role ?? '')
+      setCompany(cap.company ?? '')
+      setJdText(cap.jdText)
+      setStatus(
+        cap.jdText.length > 200
+          ? `Captured ${cap.jdText.length.toLocaleString()} characters (${cap.source}).`
+          : 'Could not find a description on that page — paste it below.',
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+    setTimeout(() => setStatus(null), 6000)
+  }
+
+  const run = async (dryRun: boolean) => {
+    setError(null)
+    setResult(null)
+    setJob(null)
+
+    const built = toRequest(captured ?? { role: null, company: null, location: null, jdText: '', url: null, source: 'none' },
+      { role, company, jdText })
+    if ('problem' in built) {
+      setError(built.problem)
+      return
+    }
+
+    if (!dryRun) {
+      const ok = confirm(
+        `Generate a tailored résumé draft for "${built.request.role}"?\n\n` +
+        `This runs the full pipeline against your Anthropic key — roughly ${costLabel(estimateCostUsd())}, ` +
+        `a few minutes. The budget ceiling stops it going further.\n\n` +
+        `You review and approve the draft before any document is rendered.`,
+      )
+      if (!ok) return
+    }
+
+    setRunning(true)
+    setLastDryRun(dryRun)
+    abort.current = new AbortController()
+    try {
+      const started = await startTailor({
+        ...built.request,
+        // renderDocx:false = draft mode — the document is rendered by
+        // /finalize only after the user approves (possibly edited) sections.
+        options: { ...(built.request.options ?? {}), dryRun, renderDocx: false },
+      })
+      setJob(started)
+      const finished = await pollUntilDone(started.jobId, setJob, { signal: abort.current.signal })
+      if (finished.status === 'done' && finished.result) {
+        setResult(finished.result)
+        if (!dryRun && !finished.result.finalized) beginReview(finished.result)
+        setStatus(dryRun
+          ? 'Preflight complete.'
+          : `Draft ready — ${costLabel(finished.costUsd ?? 0)} spent. Review below, then approve.`)
+      } else if (finished.status === 'failed') {
+        setError(finished.error ?? 'The run failed.')
+      } else if (finished.status === 'cancelled') {
+        setStatus('Run cancelled.')
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+    setRunning(false)
+  }
+
+  const stop = async () => {
+    if (job) await cancelJob(job.jobId).catch(() => null)
+    abort.current?.abort()
+    setRunning(false)
+  }
+
+  const save = async () => {
+    if (!result) return
+    try {
+      const saved = await saveResultAsDocument(result, { makeDefault })
+      setStatus(
+        makeDefault
+          ? `Saved "${saved.name}" and starred it — this is the résumé that will attach next.`
+          : `Saved "${saved.name}". Another résumé is still starred, so star this one in Documents ` +
+          'if you want it attached instead.',
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  /** Approve the draft: send ONLY what actually changed. An edited piece is
+   *  human-reviewed by definition, so the service clears its flags; anything
+   *  untouched keeps its generated text — and its warnings. */
+  const approve = async () => {
+    if (!result) return
+    setFinalizing(true)
+    setError(null)
+    try {
+      const edits: FinalizeRequest = {}
+      const summaryNow = editSummary.trim()
+      if (summaryNow && summaryNow !== (result.summary ?? '').trim()) edits.summary = summaryNow
+      const skillsNow = editSkills
+        .map((s) => ({ category: s.category.trim(), skills: s.skills.trim() }))
+        .filter((s) => s.category && s.skills)
+      if (skillsNow.length && JSON.stringify(skillsNow) !== JSON.stringify(result.skills ?? [])) {
+        edits.skills = skillsNow
+      }
+      const bulletEdits = result.bullets
+        .map((b) => ({ slot: b.slot, text: (editBullets[b.slot] ?? b.text).trim() }))
+        .filter((e, i) => e.text && e.text !== result.bullets[i].text.trim())
+      if (bulletEdits.length) edits.bullets = bulletEdits
+
+      const finished = await finalizeJob(result.jobId, edits)
+      if (finished.result) {
+        setResult(finished.result)
+        const n = (edits.bullets?.length ?? 0) + (edits.summary ? 1 : 0) + (edits.skills ? 1 : 0)
+        setStatus(n
+          ? `Approved with ${n} edit${n === 1 ? '' : 's'} — résumé drafted below.`
+          : 'Approved as generated — résumé drafted below.')
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+    setFinalizing(false)
+  }
+
+  /** Start (or restart) letter generation for the current run and poll it in. */
+  const generateLetter = async () => {
+    if (!result) return
+    const regenerating = result.coverLetterStatus === 'done'
+    const ok = confirm(
+      `${regenerating ? 'Regenerate' : 'Generate'} a cover letter for "${result.role}"?\n\n` +
+      `Uses this run's analysis and your verified résumé record — roughly ` +
+      `${costLabel(estimateCoverLetterCostUsd())}, under a minute. The résumé is untouched.`,
+    )
+    if (!ok) return
+    setLetterBusy(true)
+    setLetterStatus(null)
+    setError(null)
+    try {
+      await requestCoverLetter(result.jobId)
+      const finished = await pollCoverLetter(
+        result.jobId,
+        (j) => { if (j.result) setResult(j.result) },
+        { signal: abort.current?.signal ?? undefined },
+      )
+      const r = finished.result
+      if (r?.coverLetterStatus === 'done') {
+        setLetterStatus(r.coverLetter?.needsHumanReview
+          ? 'Cover letter drafted — the gate flagged parts of it; read before sending.'
+          : 'Cover letter drafted.')
+      } else if (r?.coverLetterStatus === 'failed') {
+        setError(r.coverLetterError ?? 'Cover letter generation failed.')
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+    setLetterBusy(false)
+  }
+
+  const copyLetter = async () => {
+    if (!result?.coverLetter?.text) return
+    try {
+      await navigator.clipboard.writeText(result.coverLetter.text)
+      setLetterStatus('Letter copied to the clipboard.')
+    } catch {
+      setLetterStatus('Could not copy — select the text and copy it manually.')
+    }
+  }
+
+  const saveLetter = async () => {
+    if (!result) return
+    try {
+      const saved = await saveCoverLetterAsDocument(result)
+      setLetterStatus(`Saved "${saved.name}" to Documents as a cover letter — it will only ` +
+        'ever be offered to cover-letter upload zones.')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  // --- service down ---------------------------------------------------------
+  if (!checking && !health) {
+    return (
+      <div>
+        <h3>Tailor</h3>
+        <p className="muted">
+          Generates a résumé tailored to a specific posting, then drops it straight into your
+          Documents so it attaches like any other stored résumé.
+        </p>
+        <div className="note" style={{ marginTop: 10 }}>
+          <strong>The Tailor service isn’t running.</strong>
+          <div className="sub" style={{ marginTop: 6 }}>
+            Start it from the project root:
+            <pre style={{ margin: '6px 0', whiteSpace: 'pre-wrap' }}>make serve</pre>
+            Nothing is sent anywhere until it is running — FlashFiller does not retry in the
+            background.
+          </div>
+        </div>
+        {error && <div className="note warn" style={{ marginTop: 8 }}>{error}</div>}
+        {serviceFields()}
+      </div>
+    )
+  }
+
+  const blocked = health ? !health.apiKeyPresent || !health.vaultReady : false
+  const stage = job?.stage ? (STAGE_LABELS[job.stage] ?? job.stage) : null
+
+  return (
+    <div>
+      <h3>Tailor</h3>
+      <p className="muted">
+        Reads the posting in the active tab and drafts a summary, skills section, and STAR bullets
+        against your vault. You review and edit the draft; only after you approve does it render the
+        ATS-clean .docx for Documents. Never submits anything.
+      </p>
+
+      {checking && <div className="note">Checking the service…</div>}
+
+      {/* Service + token row.
+          `/health` is deliberately public so this tab can report the service is
+          up before anything is configured — which meant a RUNNING service
+          rendered this view with the token field nowhere on screen, and the
+          only way to reach it was to stop the service. The token belongs here,
+          reachable whatever the connection state. */}
+      {health && (
+        <div className="note" style={{ marginTop: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <span>Service connected{health.activeJobs ? ` · ${health.activeJobs} job running` : ''}</span>
+            <span style={{ flex: 1 }} />
+            <button className="btn small" onClick={() => setShowToken((v) => !v)}>
+              {token ? 'Change address / token' : 'Set address & token'}
+            </button>
+          </div>
+
+          {(showToken || !token) && serviceFields()}
+
+          {!token && (
+            <div className="sub" style={{ marginTop: 6 }}>
+              Required before <strong>Generate</strong> — without it the service returns 401.
+              It is printed when <code>make serve</code> starts, and cached in{' '}
+              <code>apps/mapper/.tailor-token</code>.
+            </div>
+          )}
+          {tokenSaved && <div className="sub" style={{ marginTop: 6 }}>Token saved.</div>}
+        </div>
+      )}
+
+      {health && blocked && (
+        <div className="note warn" style={{ marginTop: 8 }}>
+          <strong>Not ready to run.</strong>
+          <ul style={{ margin: '6px 0 0 16px' }}>
+            {!health.apiKeyPresent && <li>ANTHROPIC_API_KEY is not set — paid runs are refused.</li>}
+            {!health.vaultReady && <li>{health.vaultDetail}</li>}
+          </ul>
+        </div>
+      )}
+
+      <div style={{ marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button className="btn primary" onClick={() => void capture()} disabled={running}>
+          Read this page
+        </button>
+        <button className="btn" onClick={() => void run(true)} disabled={running}>
+          Preflight (free)
+        </button>
+        <button className="btn" onClick={() => void run(false)} disabled={running || blocked}>
+          Generate — ~{costLabel(estimateCostUsd())}
+        </button>
+        {running && <button className="btn small danger" onClick={() => void stop()}>Stop</button>}
+      </div>
+
+      {status && <div className="note" style={{ marginTop: 8 }}>{status}</div>}
+      {error && <div className="note warn" style={{ marginTop: 8 }}>{error}</div>}
+
+      <div style={{ marginTop: 12, display: 'grid', gap: 8 }}>
+        <label className="label">
+          Job title
+          <input value={role} onChange={(e) => setRole(e.target.value)} placeholder="Junior Manufacturing Engineer" />
+        </label>
+        <label className="label">
+          Company <span className="muted">(optional)</span>
+          <input value={company} onChange={(e) => setCompany(e.target.value)} />
+        </label>
+        <label className="label">
+          Job description
+          <textarea
+            rows={8}
+            value={jdText}
+            onChange={(e) => setJdText(e.target.value)}
+            placeholder="Captured from the page, or paste it here."
+          />
+          <span className="sub">
+            {jdText.length.toLocaleString()} characters
+            {captured?.source && captured.source !== 'none' ? ` · via ${captured.source}` : ''}
+            {jdText.length > 0 && jdText.length < 200 ? ' · too short to run' : ''}
+          </span>
+        </label>
+      </div>
+
+      {job && running && (
+        <div className="note" style={{ marginTop: 12 }}>
+          <strong>{stage ?? 'Working'}…</strong>
+          <div className="sub">
+            {Math.round((job.progress ?? 0) * 100)}% · job {job.jobId}
+            {job.costUsd ? ` · ${costLabel(job.costUsd)} so far` : ''}
+          </div>
+        </div>
+      )}
+
+      {/* ---- dry-run: the preflight notes, nothing to review ------------- */}
+      {result && lastDryRun && (
+        <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+          <strong>Preflight</strong>
+          <ol style={{ margin: '10px 0 0 18px', padding: 0 }}>
+            {result.bullets.map((b) => (
+              <li key={b.slot} style={{ marginBottom: 6 }}>{b.text}</li>
+            ))}
+          </ol>
+        </div>
+      )}
+
+      {/* ---- draft review: view + edit, nothing rendered until approval --- */}
+      {result && !lastDryRun && !result.finalized && (
+        <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <strong>Review the draft</strong>
+            <span className="muted">· {costLabel(result.costUsd)} spent · nothing is rendered until you approve</span>
+          </div>
+
+          {result.needsHumanReview && (
+            <div className="note warn" style={{ marginTop: 8 }}>
+              <strong>The pipeline flagged parts of this draft.</strong>{' '}
+              {result.reviewReason ?? 'Some pieces did not clear the gate.'}
+              <div className="sub" style={{ marginTop: 4 }}>
+                Fix them here — anything you edit counts as reviewed; anything you leave keeps its ⚠.
+              </div>
+            </div>
+          )}
+
+          {result.summary != null ? (
+            <label className="label" style={{ marginTop: 12, display: 'block' }}>
+              Professional summary
+              <textarea
+                rows={3}
+                value={editSummary}
+                onChange={(e) => setEditSummary(e.target.value)}
+              />
+              <span className="sub">{editSummary.trim().split(/\s+/).filter(Boolean).length} words</span>
+            </label>
+          ) : (
+            <div className="note" style={{ marginTop: 12 }}>
+              This run produced bullets only — no summary/skills sections (pre-Phase-6 pipeline).
+            </div>
+          )}
+
+          {editSkills.length > 0 && (
+            <div style={{ marginTop: 10 }}>
+              <div className="label">Technical skills</div>
+              {editSkills.map((line, i) => (
+                <div key={i} style={{ display: 'flex', gap: 6, marginTop: 6 }}>
+                  <input
+                    value={line.category}
+                    onChange={(e) =>
+                      setEditSkills((prev) => prev.map((l, j) => (j === i ? { ...l, category: e.target.value } : l)))
+                    }
+                    style={{ flex: '0 0 38%' }}
+                    placeholder="Category:"
+                  />
+                  <input
+                    value={line.skills}
+                    onChange={(e) =>
+                      setEditSkills((prev) => prev.map((l, j) => (j === i ? { ...l, skills: e.target.value } : l)))
+                    }
+                    style={{ flex: 1 }}
+                    placeholder="Skill, skill, skill"
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div style={{ marginTop: 10 }}>
+            <div className="label">Experience bullets</div>
+            {result.bullets.map((b) => (
+              <div key={b.slot} style={{ marginTop: 8 }}>
+                <span className="sub">
+                  {b.slot}. [{b.category}]
+                  {b.needs_human_review && <span className="warn"> ⚠ flagged</span>}
+                </span>
+                <textarea
+                  rows={3}
+                  value={editBullets[b.slot] ?? b.text}
+                  onChange={(e) => setEditBullets((prev) => ({ ...prev, [b.slot]: e.target.value }))}
+                  style={{ width: '100%', marginTop: 2 }}
+                />
+              </div>
+            ))}
+          </div>
+
+          <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button className="btn primary" onClick={() => void approve()} disabled={finalizing}>
+              {finalizing ? 'Drafting…' : 'Approve & draft résumé'}
+            </button>
+            <button className="btn" onClick={() => result && beginReview(result)} disabled={finalizing}>
+              Reset edits
+            </button>
+          </div>
+
+          {result.runDir && (
+            <p className="muted" style={{ marginTop: 8 }}>
+              Full run artifacts: <code>{result.runDir}</code>
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* ---- finalized: the approved résumé, viewable and saveable -------- */}
+      {result && !lastDryRun && result.finalized && (
+        <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <strong>Approved résumé</strong>
+            <span className="muted">· {costLabel(result.costUsd)}</span>
+            {result.document && (
+              <>
+                <button className="btn small primary" onClick={() => void save()}>
+                  {result.needsHumanReview ? 'Save anyway →  Documents' : 'Save to Documents'}
+                </button>
+                <button className="btn small" onClick={() => downloadResultDocument(result)}>
+                  View / download .docx
+                </button>
+              </>
+            )}
+          </div>
+
+          {result.document && (
+            <label
+              className="muted"
+              style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 6, cursor: 'pointer' }}
+              title="Documents only auto-star the first résumé you store. Without this, an older résumé stays the one that attaches."
+            >
+              <input
+                type="checkbox"
+                checked={makeDefault}
+                onChange={(e) => setMakeDefault(e.target.checked)}
+              />
+              Make this the résumé that attaches (★)
+            </label>
+          )}
+
+          {result.needsHumanReview && (
+            <div className="note warn" style={{ marginTop: 8 }}>
+              <strong>Still flagged.</strong> {result.reviewReason ?? 'Some unedited pieces did not clear the gate.'}
+              <div className="sub" style={{ marginTop: 4 }}>
+                These are the parts you left as generated — read them before this goes to an employer.
+              </div>
+            </div>
+          )}
+
+          {result.summary && (
+            <div style={{ marginTop: 10 }}>
+              <div className="label">Professional summary</div>
+              <p style={{ margin: '4px 0 0 0' }}>{result.summary}</p>
+            </div>
+          )}
+
+          {(result.skills?.length ?? 0) > 0 && (
+            <div style={{ marginTop: 10 }}>
+              <div className="label">Technical skills</div>
+              {result.skills!.map((line, i) => (
+                <p key={i} style={{ margin: '4px 0 0 0' }}>
+                  <strong>{line.category}</strong> {line.skills}
+                </p>
+              ))}
+            </div>
+          )}
+
+          <div className="label" style={{ marginTop: 10 }}>Experience bullets</div>
+          <ol style={{ margin: '6px 0 0 18px', padding: 0 }}>
+            {result.bullets.map((b) => (
+              <li key={b.slot} style={{ marginBottom: 6 }}>
+                <span className="sub">[{b.category}]</span>{' '}
+                {b.text}
+                {b.needs_human_review && <span className="warn"> ⚠</span>}
+              </li>
+            ))}
+          </ol>
+
+          {result.runDir && (
+            <p className="muted" style={{ marginTop: 8 }}>
+              Full run artifacts: <code>{result.runDir}</code>
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* ---- cover letter: its own button, its own spend, never auto ------ */}
+      {result && !lastDryRun && (
+        <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <strong>Cover letter</strong>
+            {result.coverLetterStatus !== 'running' && !letterBusy && (
+              <button
+                className="btn small primary"
+                onClick={() => void generateLetter()}
+                disabled={blocked}
+              >
+                {result.coverLetterStatus === 'done'
+                  ? `Regenerate — ~${costLabel(estimateCoverLetterCostUsd())}`
+                  : `Generate cover letter — ~${costLabel(estimateCoverLetterCostUsd())}`}
+              </button>
+            )}
+            {result.coverLetter && (
+              <>
+                <button className="btn small" onClick={() => void copyLetter()}>Copy text</button>
+                {result.coverLetterDocument && (
+                  <>
+                    <button className="btn small" onClick={() => downloadCoverLetterDocument(result)}>
+                      Download .docx
+                    </button>
+                    <button className="btn small" onClick={() => void saveLetter()}>
+                      Save to Documents
+                    </button>
+                  </>
+                )}
+              </>
+            )}
+          </div>
+
+          {!result.coverLetter && result.coverLetterStatus !== 'running' && !letterBusy && (
+            <p className="muted" style={{ marginTop: 6 }}>
+              Reasons over every part of the posting (one question per JD section), answers each
+              from your verified record, then writes a four-paragraph letter. Uses this run’s
+              analysis — the résumé is untouched, and nothing is ever attached automatically.
+            </p>
+          )}
+
+          {(result.coverLetterStatus === 'running' || letterBusy) && (
+            <div className="note" style={{ marginTop: 8 }}>
+              <strong>Writing the cover letter…</strong>
+              <div className="sub">Question set → fact-grounded answers → letter → gate. Under a minute.</div>
+            </div>
+          )}
+
+          {letterStatus && <div className="note" style={{ marginTop: 8 }}>{letterStatus}</div>}
+
+          {result.coverLetterStatus === 'failed' && result.coverLetterError && (
+            <div className="note warn" style={{ marginTop: 8 }}>
+              <strong>Letter generation failed.</strong> {result.coverLetterError}
+            </div>
+          )}
+
+          {result.coverLetter && (
+            <>
+              {result.coverLetter.needsHumanReview && (
+                <div className="note warn" style={{ marginTop: 8 }}>
+                  <strong>The letter gate flagged parts of this draft.</strong>
+                  {(result.coverLetter.defects?.length ?? 0) > 0 && (
+                    <ul style={{ margin: '6px 0 0 16px' }}>
+                      {result.coverLetter.defects!.map((d, i) => <li key={i}>{d}</li>)}
+                    </ul>
+                  )}
+                  <div className="sub" style={{ marginTop: 4 }}>
+                    Read it before sending — copy it out and fix what the gate could not.
+                  </div>
+                </div>
+              )}
+              <div
+                style={{
+                  marginTop: 10, padding: 10, border: '1px solid var(--border)',
+                  borderRadius: 6, whiteSpace: 'pre-wrap',
+                }}
+              >
+                {result.coverLetter.text}
+              </div>
+              <p className="muted" style={{ marginTop: 6 }}>
+                {result.coverLetter.wordCount ?? 0} words · thinking trace in{' '}
+                <code>{result.runDir ? `${result.runDir}/7_cover_letter_thinking.json` : '7_cover_letter_thinking.json'}</code>
+              </p>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}

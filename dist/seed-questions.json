@@ -1,0 +1,1921 @@
+{
+ "schemaVersion": 2,
+ "note": "Read-only seed catalog bundled with the extension. The training flow reads this and writes only ANSWERED questions into the user's qa store. answerType: 'profile' resolves from the user profile (no typing needed once the profile is filled); 'freeText' is answered during training; 'composite' renders a template over a structured profile array. autofillByDefault=false items are surfaced but never auto-filled.",
+ "categories": [
+  {
+   "id": "contact",
+   "label": "Contact & identity"
+  },
+  {
+   "id": "links",
+   "label": "Links & portfolio"
+  },
+  {
+   "id": "work_authorization",
+   "label": "Work authorization"
+  },
+  {
+   "id": "logistics",
+   "label": "Availability & logistics"
+  },
+  {
+   "id": "experience",
+   "label": "Experience & skills"
+  },
+  {
+   "id": "education",
+   "label": "Education"
+  },
+  {
+   "id": "motivation",
+   "label": "Motivation & fit"
+  },
+  {
+   "id": "behavioral",
+   "label": "Behavioral"
+  },
+  {
+   "id": "voluntary_eeo",
+   "label": "Voluntary / EEO (never auto-filled)"
+  },
+  {
+   "id": "misc",
+   "label": "Miscellaneous"
+  }
+ ],
+ "questions": [
+  {
+   "id": "first-name",
+   "category": "contact",
+   "question": "First name",
+   "aliases": [
+    "Given name",
+    "Legal first name"
+   ],
+   "fieldType": "text",
+   "answerType": "profile",
+   "mapsTo": "profile.firstName",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "last-name",
+   "category": "contact",
+   "question": "Last name",
+   "aliases": [
+    "Family name",
+    "Surname",
+    "Legal last name"
+   ],
+   "fieldType": "text",
+   "answerType": "profile",
+   "mapsTo": "profile.lastName",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "full-name",
+   "category": "contact",
+   "question": "Full name",
+   "aliases": [
+    "Name",
+    "Your name"
+   ],
+   "fieldType": "text",
+   "answerType": "composite",
+   "mapsTo": null,
+   "answerTemplate": "{{profile.firstName}} {{profile.lastName}}",
+   "variables": [
+    "profile.firstName",
+    "profile.lastName"
+   ],
+   "autofillByDefault": true
+  },
+  {
+   "id": "email",
+   "category": "contact",
+   "question": "Email address",
+   "aliases": [
+    "Email",
+    "E-mail",
+    "Contact email"
+   ],
+   "fieldType": "text",
+   "answerType": "profile",
+   "mapsTo": "profile.email",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "phone",
+   "category": "contact",
+   "question": "Phone number",
+   "aliases": [
+    "Mobile",
+    "Cell phone",
+    "Contact number",
+    "Telephone"
+   ],
+   "fieldType": "text",
+   "answerType": "profile",
+   "mapsTo": "profile.phone",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "city",
+   "category": "contact",
+   "question": "City",
+   "aliases": [
+    "Current city",
+    "City of residence",
+    "Town"
+   ],
+   "fieldType": "text",
+   "answerType": "profile",
+   "mapsTo": "profile.address.city",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "state",
+   "category": "contact",
+   "question": "State / Province",
+   "aliases": [
+    "State",
+    "Province",
+    "Region"
+   ],
+   "fieldType": "text",
+   "answerType": "profile",
+   "mapsTo": "profile.address.state",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "postal-code",
+   "category": "contact",
+   "question": "Postal / ZIP code",
+   "aliases": [
+    "ZIP code",
+    "Postcode",
+    "Postal code"
+   ],
+   "fieldType": "text",
+   "answerType": "profile",
+   "mapsTo": "profile.address.postalCode",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "country",
+   "category": "contact",
+   "question": "Country",
+   "aliases": [
+    "Country of residence",
+    "Nation"
+   ],
+   "fieldType": "select",
+   "answerType": "profile",
+   "mapsTo": "profile.address.country",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "pronouns",
+   "category": "contact",
+   "question": "What are your pronouns?",
+   "aliases": [
+    "Pronouns",
+    "Preferred pronouns"
+   ],
+   "fieldType": "text",
+   "answerType": "profile",
+   "mapsTo": "profile.pronouns",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "linkedin",
+   "category": "links",
+   "question": "LinkedIn profile URL",
+   "aliases": [
+    "LinkedIn",
+    "LinkedIn URL",
+    "Link to LinkedIn"
+   ],
+   "fieldType": "text",
+   "answerType": "profile",
+   "mapsTo": "profile.links.linkedin",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "github",
+   "category": "links",
+   "question": "GitHub profile URL",
+   "aliases": [
+    "GitHub",
+    "GitHub URL",
+    "Link to GitHub"
+   ],
+   "fieldType": "text",
+   "answerType": "profile",
+   "mapsTo": "profile.links.github",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "portfolio",
+   "category": "links",
+   "question": "Provide a link to your portfolio",
+   "aliases": [
+    "Portfolio",
+    "Portfolio URL",
+    "Link to your work"
+   ],
+   "fieldType": "text",
+   "answerType": "profile",
+   "mapsTo": "profile.links.portfolio",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "website",
+   "category": "links",
+   "question": "Personal website",
+   "aliases": [
+    "Website",
+    "Personal site",
+    "Blog URL"
+   ],
+   "fieldType": "text",
+   "answerType": "profile",
+   "mapsTo": "profile.links.website",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "work-auth",
+   "category": "work_authorization",
+   "question": "Are you legally authorized to work in the country of this position?",
+   "aliases": [
+    "Are you authorized to work?",
+    "Do you have work authorization?",
+    "Are you legally authorized to work in the United States?"
+   ],
+   "fieldType": "radio",
+   "answerType": "profile",
+   "mapsTo": "profile.authorizedToWork",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "sponsorship",
+   "category": "work_authorization",
+   "question": "Do you now or in the future require visa sponsorship?",
+   "aliases": [
+    "Will you require sponsorship?",
+    "Do you need sponsorship to work here?",
+    "Visa sponsorship required?"
+   ],
+   "fieldType": "radio",
+   "answerType": "profile",
+   "mapsTo": "profile.requiresSponsorship",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "visa-status",
+   "category": "work_authorization",
+   "question": "What is your current work visa status?",
+   "aliases": [
+    "Visa status",
+    "Immigration status",
+    "Work permit status"
+   ],
+   "fieldType": "text",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "e.g. Citizen, Permanent resident, H-1B, requires sponsorship."
+  },
+  {
+   "id": "notice-period",
+   "category": "logistics",
+   "question": "What is your notice period?",
+   "aliases": [
+    "How much notice must you give?",
+    "Notice period",
+    "How soon can you start?"
+   ],
+   "fieldType": "text",
+   "answerType": "profile",
+   "mapsTo": "profile.noticePeriod",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "e.g. 2 weeks, 1 month, immediately available."
+  },
+  {
+   "id": "start-date",
+   "category": "logistics",
+   "question": "What is your earliest available start date?",
+   "aliases": [
+    "When can you start?",
+    "Availability to start",
+    "Earliest start date"
+   ],
+   "fieldType": "text",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "salary",
+   "category": "logistics",
+   "question": "What are your salary expectations?",
+   "aliases": [
+    "Desired salary",
+    "Compensation expectations",
+    "Expected salary",
+    "Salary requirement"
+   ],
+   "fieldType": "text",
+   "answerType": "profile",
+   "mapsTo": "profile.desiredSalary",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "relocate",
+   "category": "logistics",
+   "question": "Are you willing to relocate?",
+   "aliases": [
+    "Willing to relocate?",
+    "Would you relocate?",
+    "Open to relocation?"
+   ],
+   "fieldType": "radio",
+   "answerType": "profile",
+   "mapsTo": "profile.willingToRelocate",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "work-model",
+   "category": "logistics",
+   "question": "What is your preferred work arrangement (remote / hybrid / onsite)?",
+   "aliases": [
+    "Remote or onsite?",
+    "Preferred work model",
+    "Work location preference"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "travel",
+   "category": "logistics",
+   "question": "Are you willing to travel, and up to what percentage?",
+   "aliases": [
+    "Willing to travel?",
+    "Travel availability",
+    "How much travel are you open to?"
+   ],
+   "fieldType": "text",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "years-experience",
+   "category": "experience",
+   "question": "How many years of relevant experience do you have?",
+   "aliases": [
+    "Years of experience",
+    "Total years of experience",
+    "Years in the field",
+    "How many years of relevant work experience do you have?"
+   ],
+   "fieldType": "text",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "employment-history",
+   "category": "experience",
+   "question": "Please list your last 3 employers, your titles, and your dates of employment.",
+   "aliases": [
+    "Employment history",
+    "List your previous employers",
+    "Work history"
+   ],
+   "fieldType": "textarea",
+   "answerType": "composite",
+   "mapsTo": null,
+   "answerTemplate": "{{#workHistory}}{{title}} — {{company}} ({{startDate}}–{{endDate}})\n{{/workHistory}}",
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "current-role",
+   "category": "experience",
+   "question": "What is your current or most recent job title?",
+   "aliases": [
+    "Current title",
+    "Most recent role",
+    "Present position"
+   ],
+   "fieldType": "text",
+   "answerType": "composite",
+   "mapsTo": null,
+   "answerTemplate": "{{workHistory.0.title}}",
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "current-employer",
+   "category": "experience",
+   "question": "What is your current or most recent employer?",
+   "aliases": [
+    "Current company",
+    "Most recent employer",
+    "Present employer"
+   ],
+   "fieldType": "text",
+   "answerType": "composite",
+   "mapsTo": null,
+   "answerTemplate": "{{workHistory.0.company}}",
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "key-skills",
+   "category": "experience",
+   "question": "What are your strongest technical skills?",
+   "aliases": [
+    "Key skills",
+    "Core competencies",
+    "Technologies you are strongest in"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "certifications",
+   "category": "experience",
+   "question": "Do you hold any relevant certifications or licenses?",
+   "aliases": [
+    "Certifications",
+    "Licenses",
+    "Professional certifications"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "complex-project",
+   "category": "experience",
+   "question": "Describe your most complex or impactful project.",
+   "aliases": [
+    "Tell us about a challenging project",
+    "Describe a significant project",
+    "Most complex project you've worked on"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "Persona-friendly: consider tagging different answers for frontend vs. full-stack, etc."
+  },
+  {
+   "id": "tech-experience",
+   "category": "experience",
+   "question": "Do you have experience with the technologies listed in this role?",
+   "aliases": [
+    "Relevant tech experience",
+    "Experience with our stack",
+    "Familiarity with required tools"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "highest-education",
+   "category": "education",
+   "question": "What is your highest level of education?",
+   "aliases": [
+    "Highest degree",
+    "Education level",
+    "Highest qualification"
+   ],
+   "fieldType": "select",
+   "answerType": "composite",
+   "mapsTo": null,
+   "answerTemplate": "{{education.0.degree}}, {{education.0.field}}",
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "school",
+   "category": "education",
+   "question": "Which school or university did you attend?",
+   "aliases": [
+    "University",
+    "College",
+    "Institution attended"
+   ],
+   "fieldType": "text",
+   "answerType": "composite",
+   "mapsTo": null,
+   "answerTemplate": "{{education.0.institution}}",
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "degree",
+   "category": "education",
+   "question": "What degree did you earn?",
+   "aliases": [
+    "Degree",
+    "Degree earned",
+    "Highest degree earned"
+   ],
+   "fieldType": "text",
+   "answerType": "composite",
+   "mapsTo": null,
+   "answerTemplate": "{{education.0.degree}} in {{education.0.field}}",
+   "variables": [],
+   "autofillByDefault": true,
+   "fallbacks": [
+    "{{education.0.degree}}"
+   ]
+  },
+  {
+   "id": "grad-year",
+   "category": "education",
+   "question": "What year did you graduate?",
+   "aliases": [
+    "Graduation year",
+    "Year of graduation",
+    "Completion year"
+   ],
+   "fieldType": "text",
+   "answerType": "composite",
+   "mapsTo": null,
+   "answerTemplate": "{{education.0.endDate}}",
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "why-company",
+   "category": "motivation",
+   "question": "Why do you want to work at {{company}}?",
+   "aliases": [
+    "Why this company?",
+    "What interests you about us?",
+    "Why do you want to join our team?"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [
+    "company"
+   ],
+   "autofillByDefault": true,
+   "guidance": "Use {{company}} so this reuses across applications; the extension fills the real name from the page."
+  },
+  {
+   "id": "why-role",
+   "category": "motivation",
+   "question": "Why are you interested in the {{role}} position?",
+   "aliases": [
+    "Why this role?",
+    "What draws you to this position?",
+    "Interest in the role"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [
+    "role"
+   ],
+   "autofillByDefault": true
+  },
+  {
+   "id": "why-leaving",
+   "category": "motivation",
+   "question": "Why are you leaving your current role?",
+   "aliases": [
+    "Reason for leaving",
+    "Why are you looking to move?",
+    "Why leave your current job?"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "know-about-us",
+   "category": "motivation",
+   "question": "What do you know about {{company}}?",
+   "aliases": [
+    "What do you know about our company?",
+    "Tell us what you know about us"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [
+    "company"
+   ],
+   "autofillByDefault": true
+  },
+  {
+   "id": "next-role",
+   "category": "motivation",
+   "question": "What are you looking for in your next role?",
+   "aliases": [
+    "What matters to you in your next job?",
+    "Ideal next opportunity",
+    "What are you seeking?"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "good-fit",
+   "category": "motivation",
+   "question": "What makes you a good fit for this position?",
+   "aliases": [
+    "Why are you a strong candidate?",
+    "Why should we hire you?",
+    "What makes you qualified?"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [
+    "role"
+   ],
+   "autofillByDefault": true
+  },
+  {
+   "id": "challenge",
+   "category": "behavioral",
+   "question": "Describe a significant challenge you faced and how you overcame it.",
+   "aliases": [
+    "Tell us about a difficult situation",
+    "A challenge you overcame",
+    "Describe a hard problem you solved"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "leadership",
+   "category": "behavioral",
+   "question": "Tell us about a time you led a project or team.",
+   "aliases": [
+    "Describe your leadership experience",
+    "A time you took the lead",
+    "Example of leadership"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "conflict",
+   "category": "behavioral",
+   "question": "How do you handle conflict or disagreement at work?",
+   "aliases": [
+    "Describe a workplace conflict you resolved",
+    "How do you deal with disagreements?",
+    "Handling conflict"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "failure",
+   "category": "behavioral",
+   "question": "Describe a failure or mistake and what you learned from it.",
+   "aliases": [
+    "Tell us about a time you failed",
+    "A mistake you learned from",
+    "Describe a setback"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "teamwork",
+   "category": "behavioral",
+   "question": "Give an example of working effectively in a team.",
+   "aliases": [
+    "Describe your teamwork",
+    "A time you collaborated well",
+    "Example of working with others"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "strengths-weaknesses",
+   "category": "behavioral",
+   "question": "What are your greatest strengths and areas for growth?",
+   "aliases": [
+    "Strengths and weaknesses",
+    "What is your biggest weakness?",
+    "What are you working to improve?"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "eeo-gender",
+   "category": "voluntary_eeo",
+   "question": "Gender (voluntary self-identification)",
+   "aliases": [
+    "Gender identity",
+    "What is your gender?",
+    "Gender"
+   ],
+   "fieldType": "select",
+   "answerType": "profile",
+   "mapsTo": "profile.eeo.gender",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "Voluntary self-identification. Auto-filled from your profile answer; sites phrase options differently and matching is by intent."
+  },
+  {
+   "id": "eeo-ethnicity",
+   "category": "voluntary_eeo",
+   "question": "Race / ethnicity (voluntary self-identification)",
+   "aliases": [
+    "Ethnicity",
+    "Racial background",
+    "Race",
+    "Select the races you identify with"
+   ],
+   "fieldType": "select",
+   "answerType": "profile",
+   "mapsTo": "profile.eeo.ethnicity",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "Voluntary self-identification. Auto-filled from your profile answer; sites phrase options differently and matching is by intent."
+  },
+  {
+   "id": "eeo-veteran",
+   "category": "voluntary_eeo",
+   "question": "Veteran status (voluntary self-identification)",
+   "aliases": [
+    "Are you a veteran?",
+    "Military service status",
+    "Veteran Status"
+   ],
+   "fieldType": "select",
+   "answerType": "profile",
+   "mapsTo": "profile.eeo.veteranStatus",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "Voluntary self-identification. Auto-filled from your profile answer; sites phrase options differently and matching is by intent."
+  },
+  {
+   "id": "eeo-disability",
+   "category": "voluntary_eeo",
+   "question": "Disability status (voluntary self-identification)",
+   "aliases": [
+    "Do you have a disability?",
+    "Disability disclosure",
+    "Disability Status",
+    "Disability"
+   ],
+   "fieldType": "select",
+   "answerType": "profile",
+   "mapsTo": "profile.eeo.disabilityStatus",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "Voluntary self-identification. Auto-filled from your profile answer; sites phrase options differently and matching is by intent."
+  },
+  {
+   "id": "how-heard",
+   "category": "misc",
+   "question": "How did you hear about this position?",
+   "aliases": [
+    "Where did you find this job?",
+    "Referral source",
+    "How did you learn about this role?",
+    "Where did you hear about this role?",
+    "Where did you hear about us?"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "over-18",
+   "category": "misc",
+   "question": "Are you at least 18 years of age?",
+   "aliases": [
+    "Are you over 18?",
+    "Minimum age requirement"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "prev-employed",
+   "category": "misc",
+   "question": "Have you previously been employed by this company?",
+   "aliases": [
+    "Did you work here before?",
+    "Former employee?",
+    "Prior employment with us",
+    "Have you previously worked for this company as an employee or contractor?"
+   ],
+   "fieldType": "radio",
+   "answerType": "profile",
+   "mapsTo": "profile.previouslyEmployedHere",
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "relatives",
+   "category": "misc",
+   "question": "Do you have any relatives currently employed by this company?",
+   "aliases": [
+    "Any relatives who work here?",
+    "Family employed here?",
+    "Are you related to or associated with anyone that works for this company?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "anything-else",
+   "category": "misc",
+   "question": "Is there anything else you'd like us to know?",
+   "aliases": [
+    "Additional information",
+    "Anything else to add?",
+    "Other comments"
+   ],
+   "fieldType": "textarea",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "preferred-language",
+   "category": "misc",
+   "question": "What is your preferred language for interview communications?",
+   "aliases": [
+    "Preferred language",
+    "What language do you prefer for communication?",
+    "Preferred language for interviews",
+    "What is your preferred spoken language?"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "Common on Workday questionnaires (AI recruiting assistants). Usually \"English\"."
+  },
+  {
+   "id": "preferred-contact-method",
+   "category": "misc",
+   "question": "What is your preferred method of communication for scheduling interviews?",
+   "aliases": [
+    "Preferred contact method",
+    "How would you like to be contacted?",
+    "Preferred method of communication",
+    "Best way to reach you"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "Typical options: Email / Phone / Text message."
+  },
+  {
+   "id": "contract-interest",
+   "category": "logistics",
+   "question": "If not selected for this position, would you be interested in hearing about contract roles?",
+   "aliases": [
+    "Are you open to contract roles?",
+    "Would you consider contract positions?",
+    "Are you interested in contract or temporary work?"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "security-clearance",
+   "category": "work_authorization",
+   "question": "Do you have an active security clearance?",
+   "aliases": [
+    "Do you hold a security clearance?",
+    "What is your security clearance level?",
+    "Security clearance status"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "drivers-license",
+   "category": "work_authorization",
+   "question": "Do you have a valid driver's license?",
+   "aliases": [
+    "Do you possess a valid driver's license?",
+    "Valid driver's license?"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "previously-applied",
+   "category": "misc",
+   "question": "Have you previously applied to this company?",
+   "aliases": [
+    "Have you applied here before?",
+    "Have you ever applied for a position with this company?",
+    "Have you previously applied for a job with us?"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "shift-availability",
+   "category": "logistics",
+   "question": "Which shifts are you available to work?",
+   "aliases": [
+    "What is your shift availability?",
+    "Are you available to work weekends?",
+    "Are you willing to work nights or weekends?",
+    "Which shifts can you work?"
+   ],
+   "fieldType": "checkbox",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "Multi-select friendly: comma-separate (\"Morning, Evening, Weekends\")."
+  },
+  {
+   "id": "overtime",
+   "category": "logistics",
+   "question": "Are you willing to work overtime?",
+   "aliases": [
+    "Can you work overtime if needed?",
+    "Are you available for overtime?"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "start-immediately",
+   "category": "logistics",
+   "question": "Are you available to start immediately?",
+   "aliases": [
+    "Can you start immediately?",
+    "Are you able to start right away?"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "currently-employed",
+   "category": "logistics",
+   "question": "Are you currently employed?",
+   "aliases": [
+    "Are you presently employed?",
+    "Current employment status"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "referral",
+   "category": "misc",
+   "question": "Were you referred by a current employee? If so, who?",
+   "aliases": [
+    "Referral name",
+    "Who referred you?",
+    "Were you referred to this position?",
+    "Employee referral"
+   ],
+   "fieldType": "text",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "citizenship",
+   "category": "work_authorization",
+   "question": "What is your citizenship status?",
+   "aliases": [
+    "Are you a U.S. citizen?",
+    "Citizenship",
+    "What is your citizenship?"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "Distinct from work authorization — some forms ask both."
+  },
+  {
+   "id": "drug-screen",
+   "category": "work_authorization",
+   "question": "Are you willing to undergo a pre-employment drug screening?",
+   "aliases": [
+    "Are you willing to take a drug test?",
+    "Can you pass a pre-employment drug screen?",
+    "Are you willing to take a drug screen at company expense?"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "background-check-willing",
+   "category": "work_authorization",
+   "question": "Are you willing to undergo a background check?",
+   "aliases": [
+    "Are you willing to complete a background investigation?",
+    "Would you consent to a background check if offered the position?",
+    "Are you willing to submit personal information during the pre-employment process in order to conduct background checks?"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "Willingness question only — actual consent checkboxes are never auto-checked."
+  },
+  {
+   "id": "languages-spoken",
+   "category": "misc",
+   "question": "What languages do you speak?",
+   "aliases": [
+    "Which languages are you fluent in?",
+    "Language proficiency",
+    "Languages spoken"
+   ],
+   "fieldType": "text",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "preferred-name",
+   "category": "contact",
+   "question": "Preferred name",
+   "aliases": [
+    "Name you go by",
+    "Preferred first name",
+    "What should we call you?"
+   ],
+   "fieldType": "text",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "passport",
+   "category": "work_authorization",
+   "question": "Do you have a valid passport?",
+   "aliases": [
+    "Valid passport?",
+    "Do you hold a current passport?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "itar-us-person",
+   "category": "work_authorization",
+   "question": "Are you a U.S. Person for ITAR/export-control purposes?",
+   "aliases": [
+    "Are you a U.S. person as defined by ITAR?",
+    "US Person status (export control)",
+    "Are you a US person under ITAR/EAR?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "ITAR \"U.S. Person\" = citizen, green-card holder, or protected person — NOT visa holders."
+  },
+  {
+   "id": "ear-restrictions",
+   "category": "work_authorization",
+   "question": "Are you subject to ITAR/EAR restrictions?",
+   "aliases": [
+    "Export control restrictions",
+    "Are you restricted under export control laws?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "ead-expiration",
+   "category": "work_authorization",
+   "question": "What is your work authorization expiration date?",
+   "aliases": [
+    "EAD expiration date",
+    "Work permit expiration date",
+    "When does your work authorization expire?"
+   ],
+   "fieldType": "date",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "employment-type",
+   "category": "logistics",
+   "question": "Are you seeking full-time, part-time, contract, or temporary work?",
+   "aliases": [
+    "Employment type sought",
+    "What type of employment are you seeking?",
+    "Desired employment type",
+    "Position type preference"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "on-call",
+   "category": "logistics",
+   "question": "Are you available to work on-call?",
+   "aliases": [
+    "On-call availability"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "hours-per-week",
+   "category": "logistics",
+   "question": "How many hours per week are you available to work?",
+   "aliases": [
+    "Hours available per week",
+    "Weekly availability (hours)"
+   ],
+   "fieldType": "text",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "contract-to-hire",
+   "category": "logistics",
+   "question": "Is a contract-to-hire arrangement acceptable to you?",
+   "aliases": [
+    "Contract to hire acceptable?",
+    "Open to contract-to-hire?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "weekends-holidays",
+   "category": "logistics",
+   "question": "Are you available to work weekends and holidays?",
+   "aliases": [
+    "Weekend availability",
+    "Are you available to work evenings and weekends?",
+    "Can you work holidays?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "travel-percentage",
+   "category": "logistics",
+   "question": "What percentage of time are you willing to travel?",
+   "aliases": [
+    "Willingness to travel (%)",
+    "Maximum travel percentage",
+    "How much travel are you comfortable with?",
+    "Travel requirement percentage"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "travel-domestic",
+   "category": "logistics",
+   "question": "Are you open to international travel?",
+   "aliases": [
+    "Domestic vs international travel",
+    "Are you willing to travel internationally?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "home-workspace",
+   "category": "logistics",
+   "question": "Do you have a dedicated home workspace?",
+   "aliases": [
+    "Dedicated workspace at home?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "internet",
+   "category": "logistics",
+   "question": "Do you have reliable high-speed internet at home?",
+   "aliases": [
+    "Reliable internet connection?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "timezone",
+   "category": "logistics",
+   "question": "What time zone are you located in?",
+   "aliases": [
+    "Your time zone",
+    "Time zone"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "preferred-locations",
+   "category": "logistics",
+   "question": "Which office location do you prefer?",
+   "aliases": [
+    "Preferred office location",
+    "Location preference",
+    "Which locations are you interested in?"
+   ],
+   "fieldType": "select",
+   "answerType": "notify",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "Preferred locations: NC, NY, TX, NJ, CA, WI — pick what matches this posting."
+  },
+  {
+   "id": "interview-availability",
+   "category": "logistics",
+   "question": "What is your interview availability?",
+   "aliases": [
+    "Availability for interviews",
+    "When are you available to interview?"
+   ],
+   "fieldType": "text",
+   "answerType": "notify",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "Interview availability — provide dates/times that work for you."
+  },
+  {
+   "id": "position-applying",
+   "category": "logistics",
+   "question": "Which position are you applying for?",
+   "aliases": [
+    "Position applied for",
+    "What role are you applying to?"
+   ],
+   "fieldType": "text",
+   "answerType": "notify",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "Position applied for — use the job title from this posting."
+  },
+  {
+   "id": "non-compete",
+   "category": "misc",
+   "question": "Are you currently bound by a non-compete or non-solicitation agreement?",
+   "aliases": [
+    "Non-compete agreement?",
+    "Are you subject to a non-compete?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "conflict-of-interest",
+   "category": "misc",
+   "question": "Do you have any conflict of interest or financial interest in a competitor?",
+   "aliases": [
+    "Conflict of interest?",
+    "Financial interest in a competitor?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "skills-assessment",
+   "category": "misc",
+   "question": "Are you willing to complete a skills assessment or take-home exercise?",
+   "aliases": [
+    "Willing to take an assessment?",
+    "Pre-employment assessment willingness"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "reliable-transportation",
+   "category": "misc",
+   "question": "Do you have reliable transportation?",
+   "aliases": [
+    "Reliable transportation to work?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "may-contact-employer",
+   "category": "misc",
+   "question": "May we contact your current or previous employer?",
+   "aliases": [
+    "May we contact this employer?",
+    "Permission to contact employer"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "required-certification",
+   "category": "misc",
+   "question": "Do you have the required certification or license for this role?",
+   "aliases": [
+    "Do you hold the required license?",
+    "Required certification"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "current-salary",
+   "category": "misc",
+   "question": "What is your current salary?",
+   "aliases": [
+    "Current compensation",
+    "Present salary"
+   ],
+   "fieldType": "text",
+   "answerType": "notify",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "Current salary — restricted by law in many states; answer only if you choose to."
+  },
+  {
+   "id": "references",
+   "category": "misc",
+   "question": "Please provide professional references.",
+   "aliases": [
+    "Reference name",
+    "Professional references",
+    "List your references"
+   ],
+   "fieldType": "text",
+   "answerType": "notify",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "References — provide 2–3 professional references (name, title, contact) when ready."
+  },
+  {
+   "id": "credit-check",
+   "category": "misc",
+   "question": "Do you consent to a credit check?",
+   "aliases": [
+    "Credit check consent"
+   ],
+   "fieldType": "checkbox",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "bondable",
+   "category": "misc",
+   "question": "Are you bondable?",
+   "aliases": [
+    "Have you ever been bonded?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "essential-functions",
+   "category": "misc",
+   "question": "Can you perform the essential functions of this job with or without reasonable accommodation?",
+   "aliases": [
+    "Able to perform essential job functions?",
+    "Can you perform the duties of this position with or without accommodation?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "need-accommodation",
+   "category": "misc",
+   "question": "Do you need an accommodation for the application or interview process?",
+   "aliases": [
+    "Do you require accommodation to apply?",
+    "Accommodation request"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "physical-requirements",
+   "category": "misc",
+   "question": "Are you able to meet the physical requirements of this role?",
+   "aliases": [
+    "Can you lift the required weight?",
+    "Able to stand for extended periods?",
+    "Can you lift 50 lbs?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "ppe",
+   "category": "misc",
+   "question": "Are you willing to wear required PPE or uniform?",
+   "aliases": [
+    "Willing to wear personal protective equipment?",
+    "Uniform requirement"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "vaccination",
+   "category": "misc",
+   "question": "What is your vaccination status?",
+   "aliases": [
+    "Are you fully vaccinated?",
+    "COVID-19 vaccination status"
+   ],
+   "fieldType": "select",
+   "answerType": "notify",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "guidance": "Vaccination status — sensitive and context-dependent; answer this one yourself."
+  },
+  {
+   "id": "sms-consent",
+   "category": "misc",
+   "question": "Do you consent to receive SMS/text message updates?",
+   "aliases": [
+    "Text message consent",
+    "Opt in to SMS updates"
+   ],
+   "fieldType": "checkbox",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "data-sharing-consent",
+   "category": "misc",
+   "question": "Do you consent to sharing your data with third parties?",
+   "aliases": [
+    "Third-party data sharing consent"
+   ],
+   "fieldType": "checkbox",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "gdpr-consent",
+   "category": "misc",
+   "question": "Do you consent to the processing of your personal data?",
+   "aliases": [
+    "GDPR consent",
+    "Data processing consent",
+    "Privacy notice acknowledgment"
+   ],
+   "fieldType": "checkbox",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "reference-check-consent",
+   "category": "misc",
+   "question": "Do you consent to reference checks?",
+   "aliases": [
+    "Reference check authorization"
+   ],
+   "fieldType": "checkbox",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "field-of-study",
+   "category": "education",
+   "question": "What was your field of study?",
+   "aliases": [
+    "Field of study",
+    "Major",
+    "Area of study",
+    "Discipline"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true,
+   "fallbacks": [
+    "Engineering"
+   ]
+  },
+  {
+   "id": "graduated",
+   "category": "education",
+   "question": "Did you graduate?",
+   "aliases": [
+    "Have you graduated?",
+    "Degree completed?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "sexual-orientation",
+   "category": "voluntary_eeo",
+   "question": "Sexual orientation (voluntary self-identification)",
+   "aliases": [
+    "What is your sexual orientation?"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "transgender-identity",
+   "category": "voluntary_eeo",
+   "question": "Do you identify as transgender? (voluntary)",
+   "aliases": [
+    "Transgender identity (voluntary)"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "first-generation",
+   "category": "voluntary_eeo",
+   "question": "Are you a first-generation college student?",
+   "aliases": [
+    "First-generation student?"
+   ],
+   "fieldType": "radio",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "age-range",
+   "category": "voluntary_eeo",
+   "question": "What is your age range?",
+   "aliases": [
+    "Age bracket",
+    "Which age group do you fall into?",
+    "Age group"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "phone-device-type",
+   "category": "contact",
+   "question": "Phone device type",
+   "aliases": [
+    "Device Type",
+    "Phone Type",
+    "Primary phone device type",
+    "Type of phone"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "name-prefix",
+   "category": "contact",
+   "question": "Prefix",
+   "aliases": [
+    "Name prefix",
+    "Title",
+    "Salutation",
+    "Mr/Mrs/Ms"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  },
+  {
+   "id": "name-suffix",
+   "category": "contact",
+   "question": "Suffix",
+   "aliases": [
+    "Name suffix",
+    "Generation suffix"
+   ],
+   "fieldType": "select",
+   "answerType": "freeText",
+   "mapsTo": null,
+   "answerTemplate": null,
+   "variables": [],
+   "autofillByDefault": true
+  }
+ ]
+}
